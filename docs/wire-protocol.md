@@ -1,0 +1,113 @@
+# agent-webkit wire protocol — v1.0
+
+This is the single source of truth for the protocol between L1 client (`@agent-webkit/core`)
+and any compliant server. The reference server in `server-reference/` is the canonical
+implementation.
+
+`protocol_version = "1.0"`.
+
+## Transport
+
+- All control traffic is HTTP/JSON.
+- All inbound (server → client) streaming is SSE.
+- All outbound (client → server) is `POST` with a JSON body.
+
+## Auth
+
+- Bearer token in `Authorization: Bearer <token>` header.
+- Auth can be disabled per-server via `--no-auth` (or `AGENT_WEBKIT_NO_AUTH=1`). When disabled,
+  the browser-native `EventSource` may be used; when enabled, a fetch-based SSE polyfill is
+  required because `EventSource` cannot send custom headers.
+
+## Endpoints
+
+### `POST /sessions`
+
+Create a new session. Spawns the underlying `ClaudeSDKClient` subprocess.
+
+Request body (all optional):
+```json
+{ "model": "claude-opus-4-7", "permission_mode": "default", "cwd": "/path/to/project" }
+```
+
+Response:
+```json
+{ "session_id": "uuid", "protocol_version": "1.0" }
+```
+
+### `GET /sessions/{session_id}/stream`
+
+Server-Sent Events stream. Multi-subscriber: any number of clients may subscribe to the
+same session simultaneously, each with an independent cursor.
+
+Headers honored:
+- `Last-Event-ID: <seq>` — replay from after that sequence number. Must be a non-negative integer; malformed values return `400 Bad Request`. Returns `412 Precondition Failed` if the requested seq has been evicted from the ring buffer.
+
+Events:
+- Every event has a numeric `id` (server-assigned monotonic seq), an `event` name, and JSON `data`.
+- A `:keepalive` SSE comment frame is emitted every 15s.
+
+### `POST /sessions/{session_id}/input`
+
+Body is a single inbound message (see "Inbound message types" below).
+Returns `204 No Content` on success, `409 Conflict` if a `permission_response` /
+`question_response` arrives after another subscriber already replied.
+
+### `DELETE /sessions/{session_id}`
+
+Graceful teardown. Drains the SDK client and closes all subscribers with a final `done` event.
+
+## Inbound message types
+
+All inbound messages are JSON objects with a `type` discriminator.
+
+| `type`                | Fields                                                                                          |
+| --------------------- | ----------------------------------------------------------------------------------------------- |
+| `user_message`        | `content: string \| ContentBlock[]`                                                              |
+| `interrupt`           | (none) — calls `client.interrupt()`. Does NOT push to queue.                                    |
+| `permission_response` | `correlation_id`, `behavior: "allow"\|"deny"`. With `allow`: `updated_input?`, `updated_permissions?`. With `deny`: `message?`, `interrupt?` (deny-only — aborts the in-flight turn). `interrupt` MUST NOT be sent with `allow`. |
+| `question_response`   | `correlation_id`, `answers` (shape per AskUserQuestion tool input)                              |
+| `set_permission_mode` | `mode: string`                                                                                  |
+| `set_model`           | `model: string \| null`                                                                          |
+| `stop_task`           | `task_id: string`                                                                               |
+
+`ContentBlock` is `{type:"text", text}` or `{type:"image", source:{type:"base64", media_type, data}}`.
+
+`correlation_id` for permissions is the SDK's `tool_use_id`. For AskUserQuestion it is the
+`tool_use_id` of the AskUserQuestion tool call.
+
+## Outbound SSE event types
+
+| `event`                  | `data` shape                                                                  |
+| ------------------------ | ----------------------------------------------------------------------------- |
+| `session_ready`          | `{session_id, protocol_version}` — first event                                |
+| `message_delta`          | `{message_id, delta}`                                                         |
+| `message_complete`       | `{message_id, message}`                                                       |
+| `tool_use`               | `{message_id, tool_use_id, tool_name, input}`                                 |
+| `tool_result`            | `{tool_use_id, output, is_error}`                                             |
+| `permission_request`     | `{correlation_id, tool_name, input, context}` — awaits `permission_response` |
+| `ask_user_question`      | `{correlation_id, questions}` — awaits `question_response`                    |
+| `hook_decision_request`  | `{correlation_id, hook_event, hook_input}` — optional v1                      |
+| `result`                 | `{session_id, subtype, total_cost_usd, ...}` — end of a turn                  |
+| `error`                  | `{code, message}`                                                             |
+| `mcp_status_change`      | `{server_name, status}`                                                       |
+| `done`                   | `{}` — terminal event for the session                                         |
+
+### Race semantics
+
+For `permission_request` / `ask_user_question` / `hook_decision_request`: **first reply wins**.
+Subsequent replies for the same `correlation_id` get HTTP 409.
+
+### Dual ID scheme
+
+- `id` (top-level SSE id) is a server-only monotonic seq. Used for `Last-Event-ID` resume.
+- `message_id`, `tool_use_id`, `correlation_id` are SDK-issued identifiers used for content
+  identity (delta → complete reconciliation, permission routing, etc.). Both coexist.
+
+## Known limitations (v1)
+
+- Single-host session persistence (JSONL on local disk). Cross-host resume requires moving
+  the file or implementing a `SessionStore` adapter.
+- `interrupt()` does not drain the queue — server must finish draining `receive_messages()`
+  before accepting the next `query()`.
+- Hook-decision UI plumbing emits the event but L2 does not yet expose it as a hook.

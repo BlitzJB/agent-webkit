@@ -1,0 +1,3 @@
+{"kind": "expect_user_query"}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_1", "content": [{"type": "text", "text": "part one. "}, {"type": "text", "text": "part two. "}, {"type": "text", "text": "part three."}], "model": "claude-opus-4-7", "stop_reason": "end_turn"}}
+{"kind": "outbound", "message": {"type": "ResultMessage", "session_id": "fake-long", "subtype": "success", "total_cost_usd": 0.01}}

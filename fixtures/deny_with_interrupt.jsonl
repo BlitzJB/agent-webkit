@@ -1,0 +1,4 @@
+{"kind": "expect_user_query"}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_1", "content": [{"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"command": "rm -rf /"}}], "model": "claude-opus-4-7"}}
+{"kind": "callback_expect", "tool_name": "Bash", "tool_input": {"command": "rm -rf /"}, "context": {"tool_use_id": "tu_1"}, "respond": {"behavior": "deny", "interrupt": true}}
+{"kind": "outbound", "message": {"type": "ResultMessage", "session_id": "fake-deny", "subtype": "interrupted"}}

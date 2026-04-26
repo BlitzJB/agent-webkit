@@ -1,0 +1,6 @@
+{"kind": "expect_user_query"}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_1", "content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {"path": "/missing"}}], "model": "claude-opus-4-7"}}
+{"kind": "callback_expect", "tool_name": "Read", "tool_input": {"path": "/missing"}, "context": {"tool_use_id": "tu_1"}, "respond": {"behavior": "allow"}}
+{"kind": "outbound", "message": {"type": "UserMessage", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "ENOENT: no such file", "is_error": true}]}}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_2", "content": [{"type": "text", "text": "File missing. Try another path."}], "model": "claude-opus-4-7", "stop_reason": "end_turn"}}
+{"kind": "outbound", "message": {"type": "ResultMessage", "session_id": "fake-toolerr", "subtype": "success"}}

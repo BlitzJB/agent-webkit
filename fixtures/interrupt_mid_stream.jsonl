@@ -1,0 +1,4 @@
+{"kind": "expect_user_query"}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_1", "content": [{"type": "text", "text": "thinking..."}], "model": "claude-opus-4-7", "stop_reason": null}}
+{"kind": "delay", "seconds": 0.05}
+{"kind": "outbound", "message": {"type": "ResultMessage", "session_id": "fake-interrupt", "subtype": "interrupted"}}

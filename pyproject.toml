@@ -1,0 +1,20 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = [
+    "--cov=server-reference/server",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90",
+]
+testpaths = ["tests/unit", "tests/contract"]
+
+[tool.coverage.run]
+branch = false
+source = ["server-reference/server"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

@@ -1,0 +1,4 @@
+{"kind": "expect_user_query"}
+{"kind": "outbound", "message": {"type": "SystemMessage", "subtype": "mcp_status", "server_name": "notion", "status": "connected"}}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_1", "content": [{"type": "text", "text": "MCP ready"}], "model": "claude-opus-4-7", "stop_reason": "end_turn"}}
+{"kind": "outbound", "message": {"type": "ResultMessage", "session_id": "fake-mcp", "subtype": "success"}}
