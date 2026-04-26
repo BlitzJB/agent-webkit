@@ -170,3 +170,70 @@ async def test_ask_user_question_round_trip(real_session) -> None:
 
     await asyncio.wait_for(drive(), timeout=120.0)
     assert answered, "Model did not invoke AskUserQuestion"
+
+
+@pytest.mark.asyncio
+async def test_permission_request_allow_round_trip(real_session, tmp_path) -> None:
+    """Generic ``permission_request`` → ``allow`` flow against a real tool.
+
+    AskUserQuestion exercises a *special* branch of ``can_use_tool``; this
+    covers the headline branch — Claude tries to invoke a real tool, the
+    bridge emits ``permission_request``, the test allows it, the tool runs,
+    and the turn completes.
+    """
+    target = tmp_path / "permitted.txt"
+    target.write_text("MAGIC_TOKEN_42")
+
+    await real_session.submit_user_message(
+        f"Read the file at {target}. After reading, reply with exactly the "
+        f"single word that appears in the file."
+    )
+
+    allowed = False
+
+    async def drive():
+        nonlocal allowed
+        async for ev in real_session.event_log.subscribe(after_seq=0):
+            if ev.event == "permission_request" and not allowed:
+                real_session.resolve_permission(
+                    ev.data["correlation_id"], "allow"
+                )
+                allowed = True
+            if ev.event == "result":
+                return
+
+    await asyncio.wait_for(drive(), timeout=120.0)
+    assert allowed, "Model did not invoke a permission-gated tool"
+
+
+@pytest.mark.asyncio
+async def test_permission_request_deny_with_interrupt(real_session, tmp_path) -> None:
+    """``permission_request`` → ``deny`` with ``interrupt=True`` ends the turn.
+
+    Validates the deny path threads through the bridge and the SDK accepts a
+    deny verdict without leaving the session hung.
+    """
+    target = tmp_path / "forbidden.txt"
+    target.write_text("nope")
+
+    await real_session.submit_user_message(
+        f"Read the file at {target} and tell me what's in it."
+    )
+
+    denied = False
+
+    async def drive():
+        nonlocal denied
+        async for ev in real_session.event_log.subscribe(after_seq=0):
+            if ev.event == "permission_request" and not denied:
+                real_session.resolve_permission(
+                    ev.data["correlation_id"], "deny",
+                    message="Access policy forbids reading that path.",
+                    interrupt=True,
+                )
+                denied = True
+            if ev.event == "result":
+                return
+
+    await asyncio.wait_for(drive(), timeout=120.0)
+    assert denied, "Model did not request permission for the read"
