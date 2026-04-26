@@ -10,6 +10,7 @@ testpaths = ["tests/unit", "tests/contract"]
 [tool.coverage.run]
 branch = false
 source = ["server-reference/server"]
+omit = ["server-reference/server/extras/*"]
 
 [tool.coverage.report]
 exclude_lines = [
