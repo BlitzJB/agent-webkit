@@ -124,7 +124,15 @@ class Session:
                 if self._closed:
                     return
                 self._turn_done.clear()
-                await self.client.query(msg)
+                # The real SDK's client.query() accepts either a string prompt
+                # or an async-iterable of pre-wrapped message dicts; passing a
+                # bare dict raises `TypeError: 'async for' requires __aiter__`.
+                # Wrap our queued dict in a single-yield async generator so
+                # both the real SDK and the fake (which accepts anything)
+                # work uniformly.
+                async def _once(m=msg):
+                    yield m
+                await self.client.query(_once())
                 self.touch()
             except Exception as e:
                 # On failure, re-open the gate so subsequent queries aren't deadlocked.

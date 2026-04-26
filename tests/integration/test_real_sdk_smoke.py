@@ -1,4 +1,4 @@
-"""Real-SDK end-to-end smoke test. Gated on ANTHROPIC_API_KEY env var.
+"""Real-SDK end-to-end smoke test. Gated on a real credential.
 
 We deliberately keep this minimal — fixtures cover the broad surface; this just confirms
 the bridge wires up correctly against the live SDK.
@@ -9,9 +9,16 @@ import os
 import pytest
 
 
+def _has_real_creds() -> bool:
+    return bool(
+        os.environ.get("ANTHROPIC_API_KEY")
+        or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+    )
+
+
 @pytest.mark.skipif(
-    not os.environ.get("ANTHROPIC_API_KEY"),
-    reason="ANTHROPIC_API_KEY not set; skipping integration smoke test",
+    not _has_real_creds(),
+    reason="No ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN set; skipping live SDK test",
 )
 @pytest.mark.asyncio
 async def test_plain_qa_against_real_sdk():
