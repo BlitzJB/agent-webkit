@@ -1,8 +1,16 @@
-"""Real-SDK end-to-end smoke test. Gated on a real credential.
+"""Real-SDK end-to-end ITs covering the bridge surface against a live Claude session.
 
-We deliberately keep this minimal — fixtures cover the broad surface; this just confirms
-the bridge wires up correctly against the live SDK.
+These run the actual ``ClaudeSDKClient`` (no fake) through the same
+``SessionRegistry`` / ``Session`` pipeline production uses, asserting the
+receive-loop translates SDK messages into wire events the way unit tests
+expect against the fake. Gated on real credentials.
+
+Deliberately scoped: a handful of smokes covering the core bridge contract.
+The fake-SDK unit suite is exhaustive; these exist to catch SDK-version drift
+that fakes can mask (e.g. the bare-dict regression in ``client.query()``).
 """
+from __future__ import annotations
+
 import asyncio
 import os
 
@@ -16,26 +24,114 @@ def _has_real_creds() -> bool:
     )
 
 
-@pytest.mark.skipif(
+pytestmark = pytest.mark.skipif(
     not _has_real_creds(),
-    reason="No ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN set; skipping live SDK test",
+    reason="No ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN set; skipping live SDK tests",
 )
-@pytest.mark.asyncio
-async def test_plain_qa_against_real_sdk():
+
+
+async def _wait_for_event(session, event_name: str, *, after_seq: int = 0, timeout: float = 60.0):
+    async def _consume():
+        async for ev in session.event_log.subscribe(after_seq=after_seq):
+            if ev.event == event_name:
+                return ev
+        return None
+
+    return await asyncio.wait_for(_consume(), timeout=timeout)
+
+
+async def _collect_until_result(session, *, after_seq: int = 0, timeout: float = 60.0):
+    """Drain events until (and including) the next ``result`` — used to span a turn."""
+    collected: list = []
+
+    async def _consume():
+        async for ev in session.event_log.subscribe(after_seq=after_seq):
+            collected.append(ev)
+            if ev.event == "result":
+                return collected
+        return collected
+
+    return await asyncio.wait_for(_consume(), timeout=timeout)
+
+
+@pytest.fixture
+async def real_session():
+    """A SessionRegistry-managed Session backed by the real Claude SDK."""
     from server.main import _real_sdk_factory
     from server.session import SessionConfig, SessionRegistry
 
     registry = SessionRegistry(_real_sdk_factory)
     session = await registry.create(SessionConfig())
     try:
-        await session.submit_user_message("Reply with exactly the word 'pong'.")
-
-        async def wait_for_result():
-            async for ev in session.event_log.subscribe(after_seq=0):
-                if ev.event == "result":
-                    return ev
-
-        result = await asyncio.wait_for(wait_for_result(), timeout=60.0)
-        assert result.event == "result"
+        yield session
     finally:
         await registry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_plain_qa_against_real_sdk(real_session) -> None:
+    """Baseline: a single user turn produces session_ready + assistant content + result."""
+    await real_session.submit_user_message("Reply with exactly the word 'pong'.")
+    events = await _collect_until_result(real_session)
+
+    kinds = [e.event for e in events]
+    assert kinds[0] == "session_ready", kinds
+    assert kinds[-1] == "result", kinds
+    # Some assistant-side event must appear between ready and result —
+    # don't pin the exact name (delta vs complete varies by SDK version).
+    middle = set(kinds[1:-1])
+    assert middle & {"message_delta", "message_complete", "tool_use"}, kinds
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_two_results_in_one_session(real_session) -> None:
+    """Two queued user messages produce two ``result`` events in order.
+
+    Exercises the send-loop's ``_turn_done`` gate: the second query must wait
+    for the first turn to drain before dispatching.
+    """
+    await real_session.submit_user_message("Reply with exactly: one")
+    first = await _wait_for_event(real_session, "result")
+    assert first is not None
+
+    await real_session.submit_user_message("Reply with exactly: two")
+    second = await _wait_for_event(real_session, "result", after_seq=first.seq)
+    assert second is not None
+    assert second.seq > first.seq
+
+
+@pytest.mark.asyncio
+async def test_interrupt_settles_session_cleanly(real_session) -> None:
+    """An ``interrupt()`` mid-stream still produces a terminal ``result`` event.
+
+    Doesn't pin the result subtype (SDK may surface ``interrupted`` or settle
+    naturally if the model finished before interrupt landed) — the contract
+    we care about is that the session is not left in a hung state.
+    """
+    await real_session.submit_user_message(
+        "Count from 1 to 50 slowly, one number per line."
+    )
+    # Fire-and-forget the interrupt shortly after dispatch.
+    await asyncio.sleep(0.5)
+    try:
+        await real_session.interrupt()
+    except Exception:
+        # Some SDK versions raise if there's nothing in flight — acceptable.
+        pass
+
+    result = await _wait_for_event(real_session, "result")
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_set_permission_mode_round_trip(real_session) -> None:
+    """``set_permission_mode`` survives the round-trip through the real client."""
+    # No assertion on side-effects beyond "doesn't raise" — the SDK owns the mode
+    # state internally; we just need the bridge to forward without error.
+    await real_session.set_permission_mode("default")
+
+
+@pytest.mark.asyncio
+async def test_set_model_round_trip(real_session) -> None:
+    """``set_model(None)`` is the documented "use default" call — must not raise."""
+    await real_session.set_model(None)
