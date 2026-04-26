@@ -97,8 +97,11 @@ def build_can_use_tool(emit: Callable[[str, dict[str, Any]], None], router: Perm
     `emit(event_name, data)` appends a server event to the log (we lazily import the SDK
     types only inside the closure to avoid a hard dependency at import time).
     """
-    async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: dict[str, Any]) -> Any:
-        correlation_id = context.get("tool_use_id") or context.get("correlation_id") or _fallback_id()
+    async def can_use_tool(tool_name: str, tool_input: dict[str, Any], context: Any) -> Any:
+        # The real SDK passes ToolPermissionContext (a dataclass); the fake passes a dict.
+        # Tolerate both — pull tool_use_id off whichever shape we got.
+        ctx_dict = _coerce_context(context)
+        correlation_id = ctx_dict.get("tool_use_id") or ctx_dict.get("correlation_id") or _fallback_id()
 
         # AskUserQuestion is special: route via dedicated event type.
         if tool_name == "AskUserQuestion":
@@ -117,7 +120,7 @@ def build_can_use_tool(emit: Callable[[str, dict[str, Any]], None], router: Perm
             "correlation_id": correlation_id,
             "tool_name": tool_name,
             "input": tool_input,
-            "context": context,
+            "context": ctx_dict,
         })
         decision = await fut
         if decision.get("behavior") == "allow":
@@ -136,6 +139,22 @@ def build_can_use_tool(emit: Callable[[str, dict[str, Any]], None], router: Perm
             return PermissionResultDeny(**kwargs2)
 
     return can_use_tool
+
+
+def _coerce_context(ctx: Any) -> dict[str, Any]:
+    """Real SDK passes a ToolPermissionContext dataclass; the fake passes a dict.
+
+    Returns a JSON-serializable dict either way, so the rest of the bridge can
+    treat the two uniformly and the wire payload stays consistent.
+    """
+    if isinstance(ctx, dict):
+        return ctx
+    out: dict[str, Any] = {}
+    for attr in ("tool_use_id", "correlation_id", "agent_id", "suggestions"):
+        v = getattr(ctx, attr, None)
+        if v is not None:
+            out[attr] = v
+    return out
 
 
 _id_counter = 0

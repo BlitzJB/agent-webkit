@@ -135,3 +135,38 @@ async def test_set_permission_mode_round_trip(real_session) -> None:
 async def test_set_model_round_trip(real_session) -> None:
     """``set_model(None)`` is the documented "use default" call — must not raise."""
     await real_session.set_model(None)
+
+
+@pytest.mark.asyncio
+async def test_ask_user_question_round_trip(real_session) -> None:
+    """The real model invokes ``AskUserQuestion`` → bridge emits the dedicated
+    event → ``resolve_question`` returns the answer → turn completes.
+
+    Validates the full first-class question pipeline against a live session,
+    including that the bridge's ``can_use_tool`` correctly handles the SDK's
+    ``ToolPermissionContext`` dataclass (regression: the fake passes a dict,
+    the real SDK passes a dataclass — earlier versions of the bridge crashed
+    on ``context.get(...)``).
+    """
+    await real_session.submit_user_message(
+        "Call the AskUserQuestion tool now with one question 'Pick a color' "
+        "and two options 'red' and 'blue'. Do not answer it yourself — wait "
+        "for my response, then reply with exactly the color I chose."
+    )
+
+    answered = False
+
+    async def drive():
+        nonlocal answered
+        async for ev in real_session.event_log.subscribe(after_seq=0):
+            if ev.event == "ask_user_question" and not answered:
+                real_session.resolve_question(
+                    ev.data["correlation_id"],
+                    [{"question": "Pick a color", "selectedOptions": ["red"]}],
+                )
+                answered = True
+            if ev.event == "result":
+                return
+
+    await asyncio.wait_for(drive(), timeout=120.0)
+    assert answered, "Model did not invoke AskUserQuestion"
