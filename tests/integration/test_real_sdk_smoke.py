@@ -57,8 +57,8 @@ async def _collect_until_result(session, *, after_seq: int = 0, timeout: float =
 @pytest.fixture
 async def real_session():
     """A SessionRegistry-managed Session backed by the real Claude SDK."""
-    from server.main import _real_sdk_factory
-    from server.session import SessionConfig, SessionRegistry
+    from agent_webkit_server.adapters.fastapi import _real_sdk_factory
+    from agent_webkit_server.session import SessionConfig, SessionRegistry
 
     registry = SessionRegistry(_real_sdk_factory)
     session = await registry.create(SessionConfig())

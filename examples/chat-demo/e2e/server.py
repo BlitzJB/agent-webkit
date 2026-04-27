@@ -11,9 +11,9 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "server-reference"))
 sys.path.insert(0, str(ROOT))
 
-from server.auth import AuthConfig  # noqa: E402
-from server.main import create_app  # noqa: E402
-from server.session import SessionConfig  # noqa: E402
+from agent_webkit_server.auth import AuthConfig  # noqa: E402
+from agent_webkit_server.adapters.fastapi import create_app  # noqa: E402
+from agent_webkit_server.session import SessionConfig  # noqa: E402
 from tests.fake_claude_sdk import FakeClaudeSDKClient  # noqa: E402
 
 FIXTURE = ROOT / "fixtures" / "plain_qa.jsonl"

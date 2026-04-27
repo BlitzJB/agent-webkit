@@ -1,6 +1,6 @@
 # agent-webkit
 
-A two-layer JS SDK + reference Python server that exposes the
+A JS SDK + Python server library that exposes the
 [Claude Agent SDK (Python)](https://code.claude.com/docs/en/agent-sdk/python) over HTTP+SSE,
 so web/Node clients can drive an agent session with full streaming, steering, permission
 approvals, and `AskUserQuestion` handling — without re-implementing the SDK semantics on
@@ -12,14 +12,15 @@ the client.
 | ----------------------------- | ---------------------------------------------------------------------------- |
 | [`@agent-webkit/core`](packages/core)   | L1 vanilla JS SDK. Isomorphic (browser/Node/Deno/Bun). No React, no UI.       |
 | [`@agent-webkit/react`](packages/react) | L2 React abstractions. `useAgentSession()` with delta reconciliation.        |
-| [`server-reference/`](server-reference) | Reference FastAPI server. **Not shipped as part of the SDK** — example only. |
+| [`agent-webkit-server`](packages/agent-webkit-server) | Python library: core engine + bundled adapters (FastAPI, Postgres `SessionStore`). |
+| [`examples/server-fastapi/`](examples/server-fastapi) | 30-line reference deployment of the FastAPI adapter. |
 | [`tools/record-fixtures/`](tools/record-fixtures) | Drives the real SDK to produce JSONL ground-truth fixtures.       |
 | [`tests/fake_claude_sdk/`](tests/fake_claude_sdk) | Drop-in mock that replays fixtures.                                |
 | [`examples/chat-demo/`](examples/chat-demo) | Vite + React end-to-end demo.                                          |
 
 ## Architecture in one paragraph
 
-The reference server holds **one long-lived `ClaudeSDKClient` per session** (because
+The server library holds **one long-lived `ClaudeSDKClient` per session** (because
 `connect()` spawns the Claude Code CLI subprocess — fork-per-message would be brutal).
 It exposes a tiny HTTP+SSE wire protocol (`docs/wire-protocol.md`). When the SDK calls
 `can_use_tool` mid-`query()`, the server registers a `Future` keyed by `correlation_id`,
@@ -37,12 +38,10 @@ Requires `pnpm` ≥ 9 and Python ≥ 3.10.
 
 ```sh
 # Server
-cd server-reference
-pip install -e ".[dev]"
-python -m server.main --no-auth
+pip install "./packages/agent-webkit-server[fastapi]"
+python examples/server-fastapi/main.py --no-auth
 
 # Web (separate terminal)
-cd ../
 pnpm install
 pnpm --filter @agent-webkit/chat-demo dev
 ```
@@ -52,23 +51,27 @@ Open http://localhost:5173 — the demo proxies `/sessions` to the FastAPI serve
 ## Wire protocol
 
 See [`docs/wire-protocol.md`](docs/wire-protocol.md). It is the canonical source of truth
-across `@agent-webkit/core` (TS), `server-reference/` (Pydantic), and any third-party
+across `@agent-webkit/core` (TS), `agent-webkit-server` (Pydantic), and any third-party
 implementations.
 
 `protocol_version = "1.0"`.
 
 ## Testing strategy
 
-Three tiers (per `docs/wire-protocol.md` and the design notes):
+Four tiers:
 
-1. **Unit (mock SDK, fast, every commit)**: server.py logic — queue handling, SSE event
+1. **Unit (mock SDK, fast, every commit)**: server logic — queue handling, SSE event
    ordering, correlation-ID lifecycle, resume-from-seq, permission RPC roundtrip,
    race resolution (409), idle eviction, multi-subscriber fan-out.
-   Run: `cd server-reference && pytest ../tests/unit ../tests/contract`.
+   Run: `pytest tests/unit tests/contract`.
 2. **Contract (mock SDK, schema validation)**: every wire payload validated against typed
    Pydantic schemas. Run: same as unit.
-3. **Integration (real SDK, gated, nightly)**: a handful of end-to-end smoke tests, gated
-   on `ANTHROPIC_API_KEY`. Run: `pytest ../tests/integration`.
+3. **Property (Hypothesis)**: invariants for `EventLog`, `PermissionRouter`, the SDK→wire
+   translator, and the Postgres `SessionStore` adapter — covers spaces example tests can't
+   enumerate. Run: `pytest tests/properties` (Postgres examples skip without `PG_DSN` /
+   `PG_USE_DEFAULT=1`).
+4. **Integration (real SDK, gated, nightly)**: end-to-end smoke + HTTP+SSE round-trip,
+   gated on `CLAUDE_CODE_OAUTH_TOKEN`. Run: `pytest tests/integration`.
 
 For L1 / L2 / SSE parser, run `pnpm test` from the repo root.
 

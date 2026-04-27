@@ -16,7 +16,7 @@ import pytest
 
 from claude_agent_sdk.testing import run_session_store_conformance  # type: ignore
 
-from server.extras.pg_session_store import PgSessionStore
+from agent_webkit_server.adapters.pg_session_store import PgSessionStore
 
 
 @pytest.mark.asyncio

@@ -34,8 +34,8 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.asyncio
 async def test_real_sdk_full_flow_over_http_sse() -> None:
     """POST /sessions → POST /input → GET /stream → assert real Claude turn."""
-    from server.auth import AuthConfig
-    from server.main import _real_sdk_factory, create_app
+    from agent_webkit_server.auth import AuthConfig
+    from agent_webkit_server.adapters.fastapi import _real_sdk_factory, create_app
 
     app = create_app(auth=AuthConfig(disabled=True), sdk_factory=_real_sdk_factory)
     port = _free_port()

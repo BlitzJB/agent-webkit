@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 
-from server.event_log import EventLog, EvictedError
+from agent_webkit_server.event_log import EventLog, EvictedError
 
 
 async def _collect(log: EventLog, after: int = 0, limit: int | None = None) -> list[int]:

@@ -12,10 +12,10 @@ import httpx
 import pytest
 import uvicorn
 
-from server.auth import AuthConfig
-from server.main import create_app
-from server.sdk_bridge import ConflictError
-from server.session import Session, SessionConfig, SessionRegistry
+from agent_webkit_server.auth import AuthConfig
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.sdk_bridge import ConflictError
+from agent_webkit_server.session import Session, SessionConfig, SessionRegistry
 from tests.fake_claude_sdk import FakeClaudeSDKClient
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
@@ -164,7 +164,7 @@ async def test_set_permission_mode_set_model_stop_task_via_http():
 @pytest.mark.asyncio
 async def test_evicted_last_event_id_returns_412():
     """When the cursor falls outside the ring buffer, server must return 412."""
-    from server.event_log import EvictedError
+    from agent_webkit_server.event_log import EvictedError
 
     # Force an EvictedError out of EventLog.subscribe by using a tiny ring buffer.
     async def factory(_c: SessionConfig, can_use_tool: Any = None):
@@ -179,7 +179,7 @@ async def test_evicted_last_event_id_returns_412():
             # Drain to ensure events are emitted.
             await asyncio.sleep(0.2)
             # Now monkey-patch the session's event_log to raise EvictedError on subscribe.
-            from server.session import SessionRegistry  # noqa: F401
+            from agent_webkit_server.session import SessionRegistry  # noqa: F401
             # We can't easily reach the registry from here; instead, test the pre-flight
             # path by giving an absurdly large but valid seq that the buffer will never
             # contain. The current EventLog.subscribe raises EvictedError when after_seq

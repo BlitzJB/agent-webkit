@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from server.event_log import LoggedEvent
-from server.models import (
+from agent_webkit_server.event_log import LoggedEvent
+from agent_webkit_server.models import (
     AskUserQuestionData,
     ErrorData,
     HookDecisionRequestData,
@@ -24,7 +24,7 @@ from server.models import (
     ToolResultData,
     ToolUseData,
 )
-from server.session import SessionConfig, SessionRegistry
+from agent_webkit_server.session import SessionConfig, SessionRegistry
 from tests.fake_claude_sdk import FakeClaudeSDKClient
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
@@ -87,7 +87,7 @@ async def test_all_events_validate(fixture: str):
 
 def test_inbound_message_models_round_trip():
     """Inbound payloads from the wire-protocol doc must round-trip through Pydantic."""
-    from server.models import (
+    from agent_webkit_server.models import (
         Interrupt,
         PermissionResponse,
         QuestionResponse,

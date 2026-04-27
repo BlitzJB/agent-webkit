@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from server.session import SessionConfig, SessionRegistry
+from agent_webkit_server.session import SessionConfig, SessionRegistry
 from tests.fake_claude_sdk import FakeClaudeSDKClient
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"

@@ -20,9 +20,9 @@ import httpx
 import pytest
 import uvicorn
 
-from server.auth import AuthConfig
-from server.main import create_app
-from server.session import SessionConfig
+from agent_webkit_server.auth import AuthConfig
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.session import SessionConfig
 from tests.fake_claude_sdk import FakeClaudeSDKClient
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"

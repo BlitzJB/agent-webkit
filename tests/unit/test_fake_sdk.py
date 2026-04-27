@@ -72,7 +72,7 @@ async def test_fake_invokes_can_use_tool_callback_for_tool_use_fixture():
 
     async def cb(name, input, context):
         invocations.append((name, input, context))
-        from server.sdk_bridge import PermissionResultAllow
+        from agent_webkit_server.sdk_bridge import PermissionResultAllow
         return PermissionResultAllow()
 
     client._can_use_tool = cb  # type: ignore[attr-defined]
@@ -101,7 +101,7 @@ async def test_fake_routes_ask_user_question_through_callback():
 
     async def cb(name, input, context):
         invocations.append((name, input, context))
-        from server.sdk_bridge import PermissionResultAllow
+        from agent_webkit_server.sdk_bridge import PermissionResultAllow
         return PermissionResultAllow(updated_input={"answers": [{"question": "Pick a color", "selectedOptions": ["red"]}]})
 
     client._can_use_tool = cb  # type: ignore[attr-defined]

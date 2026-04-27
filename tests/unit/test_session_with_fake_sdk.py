@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from server.session import SessionConfig, SessionRegistry
+from agent_webkit_server.session import SessionConfig, SessionRegistry
 from tests.fake_claude_sdk import FakeClaudeSDKClient
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures"
@@ -23,7 +23,7 @@ def make_factory(fixture_name: str):
 @pytest.mark.asyncio
 async def test_submit_user_message_raises_backpressure_when_queue_full():
     """Bound queue must refuse fast, not block, so an HTTP handler can map it to 503."""
-    from server.session import BackpressureError, Session
+    from agent_webkit_server.session import BackpressureError, Session
 
     class StuckClient:
         async def connect(self, prompt=None): pass
@@ -110,7 +110,7 @@ async def test_read_allow_roundtrip():
 
 @pytest.mark.asyncio
 async def test_resolving_unknown_correlation_id_raises():
-    from server.sdk_bridge import ConflictError
+    from agent_webkit_server.sdk_bridge import ConflictError
 
     registry = SessionRegistry(make_factory("plain_qa"))
     session = await registry.create(SessionConfig())
@@ -123,7 +123,7 @@ async def test_resolving_unknown_correlation_id_raises():
 
 @pytest.mark.asyncio
 async def test_double_resolve_raises_conflict():
-    from server.sdk_bridge import ConflictError
+    from agent_webkit_server.sdk_bridge import ConflictError
 
     registry = SessionRegistry(make_factory("read_allow"))
     session = await registry.create(SessionConfig())
