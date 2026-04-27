@@ -1,0 +1,86 @@
+---
+title: Postgres sessions
+description: Persist session state to Postgres for failover and very-long-lived conversations.
+---
+
+By default, agent-webkit-server holds session state in memory. That's fine for single-host deployments. For multi-host failover or sessions that need to survive process restarts, swap in the Postgres adapter.
+
+```bash
+pip install "agent-webkit-server[fastapi,postgres]"
+```
+
+## What it does
+
+The Postgres adapter implements the `SessionStore` protocol — `append`, `load`, `close`. The engine writes session events to Postgres in addition to the in-memory `EventLog`. On a fresh process, it can rehydrate a session's event history from the table.
+
+What it does **not** do:
+
+- It does **not** give you cross-host *live* fan-out. Two browsers on two different servers cannot tail the same session in real time. (See [Architecture](/docs/architecture#things-we-explicitly-didnt-build) for why.)
+- It does **not** replay an in-flight `query()`. If a host dies mid-turn, that turn is lost; the session can be reopened but the user will need to send their last message again.
+
+What it *does* give you:
+
+- **Failover.** If host A dies, the next request for that session lands on host B and rehydrates from Postgres.
+- **Very long sessions.** Increase `idle_timeout_s` aggressively without burning memory — the data is on disk.
+
+## Setup
+
+```python
+import os
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.adapters.pg_session_store import PgSessionStore
+from agent_webkit_server.auth import AuthConfig
+
+# Connect (creates a small asyncpg pool)
+store = await PgSessionStore.connect(os.environ["DATABASE_URL"], min_size=1, max_size=10)
+
+# Or, reuse an existing pool
+# store = PgSessionStore.from_pool(my_existing_pool)
+
+app = create_app(auth=AuthConfig.from_env(), session_store=store)
+```
+
+Note: the `session_store` kwarg is added in the same release as the Postgres adapter. If your version doesn't accept it, see the [server API reference](/docs/reference/server-api) for the current wiring.
+
+## Schema
+
+The adapter manages its own table on first connect. The schema is intentionally narrow:
+
+- One row per appended event, keyed by `(session_id, seq)`.
+- `event` (text), `data` (jsonb), `created_at`.
+
+You don't query this table directly; the adapter abstracts over it. If you need to introspect, the `key` argument to `append` / `load` includes the session id.
+
+## Sticky routing
+
+You still need sticky routing at your load balancer. The reason: live fan-out is in-process, so a session that's already running on host A can't suddenly serve events through host B without rehydrating. Sticky routing avoids the rehydration roundtrip on every request.
+
+Recommended approaches:
+
+- **Sticky session cookies.** Most LBs support this. Cookie value = session_id or user_id.
+- **Path-based routing.** Hash the `session_id` from the URL and pin to a host.
+
+When a host dies, the LB reroutes; the new host rehydrates from Postgres on the first request for that session. The user sees a brief stall, no lost messages (except the in-flight turn if there was one).
+
+## Operations
+
+- **Pool sizing.** Default `min_size=1, max_size=10`. Bump for high session-creation rates. Sessions don't keep a connection idle — they only borrow when appending.
+- **Vacuum.** Old events accumulate. Add a `DELETE FROM agent_webkit_events WHERE created_at < NOW() - INTERVAL '30 days'` cron job — or whatever your retention policy is.
+- **Indexes.** The adapter creates the index it needs (`(session_id, seq)`). Don't add others unless you're querying the table directly.
+- **Backups.** Standard. The data is your audit log.
+
+## What to use instead
+
+If failover isn't a hard requirement, **don't bother**. The default in-memory store is faster, simpler, and has zero ops cost. Switch only when:
+
+- You need session continuity across deploys (not just restarts).
+- You have a multi-host setup where failover matters more than session-pinning latency.
+- You want a queryable audit log of every event the agent emitted.
+
+For single-host with the only goal being "survive a deploy": consider just running zero-downtime deploys (rolling, blue-green) and letting in-flight sessions complete on the old host. Often that's enough.
+
+## Where to next
+
+- [Server API — PgSessionStore](/docs/reference/server-api#postgres-adapter)
+- [Architecture — what we didn't build](/docs/architecture#things-we-explicitly-didnt-build)
+- [Deployment guide](/docs/guides/deployment) — sizing, scaling, eviction.

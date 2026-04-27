@@ -1,53 +1,41 @@
 # @agent-webkit/core
 
-L1 vanilla JS SDK for the agent-webkit wire protocol. Isomorphic — runs in browsers,
-Node 18+, Deno, and Bun. No React, no UI, no transitive deps.
+Typed, isomorphic JS transport for the [agent-webkit](https://agent-webkit-docs.vercel.app) wire protocol.
 
-## Install
-
-```sh
-pnpm add @agent-webkit/core
+```bash
+npm install @agent-webkit/core
 ```
 
-## Usage
+Runs in browsers, Node ≥ 18, Deno, Bun, and Cloudflare Workers.
+
+## Use
 
 ```ts
 import { createAgentClient } from "@agent-webkit/core";
 
-const client = createAgentClient({ baseUrl: "http://localhost:8000", token: "..." });
-const session = await client.createSession({ model: "claude-opus-4-7" });
+const client = createAgentClient({ baseUrl: "https://api.example.com", token });
+const session = await client.createSession();
 
-await session.send("Read README.md and summarize it.");
+await session.send("Hello");
 
-for await (const ev of session.events()) {
-  switch (ev.event) {
-    case "message_delta":
-      // stream tokens
-      break;
-    case "permission_request":
-      await session.approve(ev.data.correlation_id);
-      break;
-    case "ask_user_question":
-      await session.answer(ev.data.correlation_id, { /* per AskUserQuestion shape */ });
-      break;
-    case "done":
-      return;
+for await (const event of session.events()) {
+  if (event.event === "permission_request") {
+    await session.approve(event.data.correlation_id);
   }
 }
 ```
 
-## Transport selection
+- **Streaming** with `for await`.
+- **Auto-reconnect** via `Last-Event-ID`.
+- **Permission / question RPC** as first-class methods.
+- Full type definitions for every wire event.
 
-If `token` is provided, uses fetch-based SSE (works in Node + browsers, supports custom headers).
-If no token, native `EventSource` could be used, but the fetch-based path is used uniformly to
-keep behavior consistent across runtimes. Both approaches honor `Last-Event-ID` for resume.
+## Docs
 
-## Resume
+- [Vanilla JS guide](https://agent-webkit-docs.vercel.app/docs/guides/frontend-vanilla)
+- [Core API reference](https://agent-webkit-docs.vercel.app/docs/reference/core-api)
+- [Wire protocol](https://agent-webkit-docs.vercel.app/docs/reference/wire-protocol)
 
-```ts
-const session = client.attachSession(savedId, { resumeFromEventId: savedSeq });
-for await (const ev of session.events()) { /* ... */ }
-```
+## License
 
-If the requested seq has been evicted from the server's ring buffer, `events()` throws a
-`TransportError` with status 412.
+MIT

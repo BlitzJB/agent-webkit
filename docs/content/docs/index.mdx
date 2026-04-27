@@ -1,0 +1,31 @@
+---
+title: agent-webkit
+description: A typed JS SDK + Python server library for driving the Claude Agent SDK over HTTP+SSE.
+---
+
+agent-webkit is the bridge between the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/python) and the web. It ships:
+
+- **`@agent-webkit/core`** — isomorphic JS transport (browser, Node, Deno, Bun). Typed `POST` helpers + an SSE async-iterable with auto-reconnect via `Last-Event-ID`.
+- **`@agent-webkit/react`** — `useAgentSession()` React hook with delta reconciliation, permission UI states, `AskUserQuestion` routing, and reconnect.
+- **`agent-webkit-server`** — Python library that holds long-lived `ClaudeSDKClient`s, fans out SSE to subscribers, routes permission RPC, and ships with FastAPI + Postgres adapters.
+
+## What you get out of the box
+
+- Real-time **streaming** of assistant messages and tool use.
+- **`can_use_tool`** turned into a clean SSE event + first-reply-wins race semantics. No more wrapping the SDK callback yourself.
+- **`AskUserQuestion`** routed through a dedicated event so your UI can render a typed answer dialog.
+- **Multi-subscriber fan-out** — multiple browser tabs can attach to the same session, each with its own cursor.
+- **Resume after disconnect** via `Last-Event-ID`, backed by a bounded ring buffer of past events.
+- **Pluggable session storage** — local JSONL by default, Postgres adapter for multi-host deployments.
+
+## Where to next
+
+- **New here?** [Get started](/docs/getting-started) — five-minute walkthrough from `pip install` to a working chat.
+- **React app?** Jump to the [React guide](/docs/guides/frontend-react).
+- **Vue / Svelte / Node?** [Vanilla JS guide](/docs/guides/frontend-vanilla).
+- **Backend dev?** [FastAPI guide](/docs/guides/backend-fastapi) or [build a custom adapter](/docs/guides/backend-custom-adapter).
+- **Need to understand the wire?** [Concepts](/docs/concepts) or the [protocol reference](/docs/reference/wire-protocol).
+
+## Status
+
+`v0.2.0` — public alpha. Wire protocol pinned at `1.0`. Pre-1.0 packages may have breaking JS/Python API changes between minors; the wire stays stable.

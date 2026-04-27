@@ -1,0 +1,123 @@
+---
+title: Custom backend adapter
+description: Drop the engine into Starlette, Litestar, or raw ASGI — without depending on FastAPI.
+---
+
+The FastAPI adapter is one consumer of the agent-webkit-server *engine*. The engine itself is framework-agnostic: a `SessionRegistry`, a session lifecycle, and per-session `EventLog`s. If you don't want FastAPI in your stack, you can wire the engine to any ASGI framework in ~150 lines.
+
+```bash
+pip install agent-webkit-server  # no [fastapi] extra needed
+```
+
+## What you need to expose
+
+Four endpoints, mapped to engine methods:
+
+| Method | Path                              | Engine call                                   |
+| ------ | --------------------------------- | --------------------------------------------- |
+| POST   | `/sessions`                       | `registry.create(SessionConfig(...))`         |
+| GET    | `/sessions/{id}/stream`           | `event_log.subscribe(after_seq=last_event_id)` |
+| POST   | `/sessions/{id}/input`            | `session.handle_inbound(message)`             |
+| DELETE | `/sessions/{id}`                  | `registry.remove(id)`                         |
+
+The shapes match the [wire protocol](/docs/reference/wire-protocol). Use the Pydantic models from `agent_webkit_server.models` for request/response validation.
+
+## Sketch — Starlette
+
+```python
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse, StreamingResponse, Response
+from starlette.routing import Route
+from agent_webkit_server.session import SessionRegistry, SessionConfig
+from agent_webkit_server.event_log import EvictedError
+from agent_webkit_server.sdk_factory import default_sdk_factory
+
+registry = SessionRegistry(default_sdk_factory)
+
+async def create_session(request):
+    body = await request.json()
+    session = registry.create(SessionConfig(**body))
+    return JSONResponse({"session_id": session.id, "protocol_version": "1.0"})
+
+async def stream(request):
+    session_id = request.path_params["id"]
+    session = registry.get(session_id)
+    if not session:
+        return Response(status_code=404)
+
+    last = int(request.headers.get("Last-Event-ID", "0"))
+
+    async def gen():
+        try:
+            async for evt in session.event_log.subscribe(after_seq=last):
+                yield format_sse(evt)
+        except EvictedError:
+            return  # client must reset
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+async def input_message(request):
+    session_id = request.path_params["id"]
+    session = registry.get(session_id)
+    if not session:
+        return Response(status_code=404)
+
+    body = await request.json()
+    try:
+        await session.handle_inbound(body)
+    except ConflictError:
+        return Response(status_code=409)
+    return Response(status_code=204)
+
+async def delete_session(request):
+    await registry.remove(request.path_params["id"])
+    return Response(status_code=204)
+
+app = Starlette(routes=[
+    Route("/sessions", create_session, methods=["POST"]),
+    Route("/sessions/{id}/stream", stream, methods=["GET"]),
+    Route("/sessions/{id}/input", input_message, methods=["POST"]),
+    Route("/sessions/{id}", delete_session, methods=["DELETE"]),
+])
+```
+
+`format_sse(evt)` is a tiny helper: it produces `id: <seq>\nevent: <name>\ndata: <json>\n\n`. The FastAPI adapter has a copy you can crib.
+
+## Auth
+
+The engine doesn't enforce auth — that's your adapter's job. Wrap your routes in whatever middleware your framework offers (Starlette `AuthenticationMiddleware`, Litestar guards, ASGI middleware) and validate the `Authorization: Bearer ...` header before calling the engine.
+
+If you want the same `AuthConfig` semantics as the FastAPI adapter, import it:
+
+```python
+from agent_webkit_server.auth import AuthConfig
+```
+
+…and check the token in your middleware.
+
+## Keepalive
+
+The FastAPI adapter emits a `:keepalive` SSE comment every 15 seconds to keep proxies from idling out the connection. If you replicate the adapter, do the same. Easiest pattern:
+
+```python
+async def keepalive_loop(queue):
+    while True:
+        await asyncio.sleep(15)
+        await queue.put(":keepalive\n\n")
+```
+
+…and merge it into your SSE generator.
+
+## Why might you want this
+
+- You're already on Litestar / aiohttp / Quart and don't want a second framework.
+- You're embedding the engine in a larger ASGI app where mounting `create_app` would conflict with routing.
+- You need to wrap every endpoint in custom middleware that's awkward through `Depends`.
+
+If none of those apply, **stick with the FastAPI adapter**. It's tested, it ships keepalive and CORS-friendly headers, and updating it is one of our jobs.
+
+## Where to next
+
+- [Server API reference](/docs/reference/server-api) — `SessionRegistry`, `EventLog`, models.
+- [Wire protocol](/docs/reference/wire-protocol) — the contract you're implementing.
+- [Postgres sessions](/docs/guides/postgres-sessions) — drop-in storage adapter.

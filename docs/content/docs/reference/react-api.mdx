@@ -1,0 +1,140 @@
+---
+title: "@agent-webkit/react API"
+description: useAgentSession() and the state machine it exposes.
+---
+
+```bash
+npm install @agent-webkit/react @agent-webkit/core
+```
+
+`@agent-webkit/react` is a thin wrapper over `@agent-webkit/core`. It owns the SSE iterator, reduces events into a typed message list, and surfaces permission / question state.
+
+## `useAgentSession(opts)`
+
+```tsx
+import { useAgentSession } from "@agent-webkit/react";
+
+const session = useAgentSession({
+  baseUrl: "https://api.example.com",
+  token: "...",
+});
+```
+
+### `UseAgentSessionOptions`
+
+| Field                | Type                  | Default | Notes                                     |
+| -------------------- | --------------------- | ------- | ----------------------------------------- |
+| `baseUrl`            | `string`              | —       | Required when `client` is not provided.   |
+| `token`              | `string`              | —       | Bearer token forwarded to transport.      |
+| `sessionId`          | `string`              | —       | Attach to an existing session instead of creating one. |
+| `resumeFromEventId`  | `string`              | —       | Resume from a specific SSE seq.           |
+| `create`             | `CreateSessionOptions`| —       | Forwarded to `POST /sessions` when creating. |
+| `client`             | `AgentClient`         | —       | Inject a pre-built client (testing).      |
+| `autoStart`          | `boolean`             | `true`  | If `false`, you call `session.start()` manually. |
+
+### Return value
+
+```ts
+interface UseAgentSessionReturn {
+  // State
+  messages: DisplayMessage[];
+  status: Status;
+  pendingPermission: PendingPermission | null;
+  pendingQuestion: PendingQuestion | null;
+  lastError: { code: string; message: string } | null;
+  totalCostUsd: number;
+  sessionId: string | null;
+
+  // Actions
+  send(input: UserInput): Promise<void>;
+  interrupt(): Promise<void>;
+  approve(correlationId: string, options?: ApproveOptions): Promise<void>;
+  deny(correlationId: string, options?: DenyOptions): Promise<void>;
+  answer(correlationId: string, answers: unknown): Promise<void>;
+  setPermissionMode(mode: string): Promise<void>;
+  setModel(model: string | null): Promise<void>;
+  stopTask(taskId: string): Promise<void>;
+  close(): Promise<void>;
+}
+```
+
+## State machine
+
+### `Status`
+
+```ts
+type Status =
+  | "idle"
+  | "streaming"
+  | "awaiting_permission"
+  | "awaiting_question"
+  | "awaiting_hook"
+  | "error";
+```
+
+Transitions:
+
+- `idle → streaming` on `send()`.
+- `streaming → awaiting_permission | awaiting_question` when the server emits `permission_request` / `ask_user_question`.
+- `awaiting_* → streaming` after you call `approve` / `deny` / `answer` (or another subscriber wins the race).
+- Any → `error` on a fatal transport or server error.
+- Any → `idle` after a turn-final `result` event.
+
+### `DisplayMessage`
+
+A discriminated union built by reducing `message_delta`, `message_complete`, `tool_use`, and `tool_result` events:
+
+```ts
+type DisplayMessage =
+  | { kind: "user"; id: string; content: ContentBlock[] }
+  | {
+      kind: "assistant";
+      id: string;
+      message_id: string;
+      content: ContentBlock[];
+      streaming: boolean;
+    }
+  | {
+      kind: "tool_result";
+      id: string;
+      tool_use_id: string;
+      output: string;
+      is_error: boolean;
+    };
+```
+
+Use `streaming: true` to render a typing indicator on the assistant's current message.
+
+### `PendingPermission`
+
+```ts
+interface PendingPermission {
+  correlation_id: string;
+  tool_name: string;
+  input: Record<string, unknown>;
+  context?: Record<string, unknown>;
+}
+```
+
+Render a modal, then call `approve(pendingPermission.correlation_id)` or `deny(pendingPermission.correlation_id, { message: "..." })`.
+
+### `PendingQuestion`
+
+```ts
+interface PendingQuestion {
+  correlation_id: string;
+  questions: { questions: AskUserQuestionItem[] };
+}
+```
+
+The double-nested `questions.questions` shape mirrors the SDK's `AskUserQuestion` tool input. Each item has a `question`, `header`, and a list of `multiSelect` options.
+
+## Race conflicts
+
+If another subscriber answers a permission or question before this client does, the `approve` / `deny` / `answer` promise rejects with a `409 Conflict` error. The reducer also clears the `pendingPermission` / `pendingQuestion` slot when a winning response is observed via the SSE stream.
+
+The recommended UI: when the slot disappears mid-render, fade out the modal and show "another tab responded".
+
+## Lower-level access
+
+Need direct stream access? Build on `@agent-webkit/core` instead — see the [core API](/docs/reference/core-api). The React hook is intentionally a thin reducer; you should never need to monkey-patch around it.

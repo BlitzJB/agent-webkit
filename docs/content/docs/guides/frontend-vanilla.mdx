@@ -1,0 +1,158 @@
+---
+title: Vanilla JS frontend
+description: Drive a session from any JS runtime — Vue, Svelte, Node bots, Cloudflare Workers, or plain browser code.
+---
+
+`@agent-webkit/core` is intentionally framework-free. It runs anywhere `fetch` runs.
+
+```bash
+npm install @agent-webkit/core
+```
+
+## Minimal browser example
+
+```ts
+import { createAgentClient } from "@agent-webkit/core";
+
+const client = createAgentClient({
+  baseUrl: "https://api.example.com",
+  token: localStorage.getItem("token") ?? undefined,
+});
+
+const session = await client.createSession({ permission_mode: "default" });
+
+await session.send("Summarize today's PRs");
+
+for await (const event of session.events()) {
+  switch (event.event) {
+    case "message_delta":
+      appendToOutput(event.data.delta);
+      break;
+
+    case "permission_request":
+      const ok = confirm(`Allow ${event.data.tool_name}?`);
+      await (ok
+        ? session.approve(event.data.correlation_id)
+        : session.deny(event.data.correlation_id, { message: "User denied" }));
+      break;
+
+    case "ask_user_question":
+      const answers = await renderQuestionDialog(event.data.questions);
+      await session.answer(event.data.correlation_id, answers);
+      break;
+
+    case "result":
+      // Turn finished. Re-enable the composer.
+      break;
+
+    case "done":
+      // Session terminated.
+      return;
+  }
+}
+```
+
+That's it — no framework needed.
+
+## Reconciling deltas
+
+The L1 client gives you raw events; you assemble messages yourself. The reducer is small:
+
+```ts
+const messages = new Map<string, AssistantMessage>();
+
+for await (const event of session.events()) {
+  if (event.event === "message_delta") {
+    const msg = messages.get(event.data.message_id) ?? newAssistant(event.data.message_id);
+    msg.content = applyDelta(msg.content, event.data.delta);
+    messages.set(event.data.message_id, msg);
+    rerender();
+  } else if (event.event === "message_complete") {
+    messages.set(event.data.message_id, event.data.message);
+    rerender();
+  }
+}
+```
+
+If you'd rather not write this yourself, see how `@agent-webkit/react`'s `reduce()` does it — that exact reducer is portable, you can copy it into a Vue/Svelte store.
+
+## Vue example (sketch)
+
+```ts
+import { ref, onMounted, onUnmounted } from "vue";
+import { createAgentClient, type Session } from "@agent-webkit/core";
+
+export function useAgent(baseUrl: string, token: string) {
+  const messages = ref<DisplayMessage[]>([]);
+  const status = ref<"idle" | "streaming">("idle");
+  let session: Session | null = null;
+
+  onMounted(async () => {
+    const client = createAgentClient({ baseUrl, token });
+    session = await client.createSession();
+    pumpEvents(session, messages, status);
+  });
+
+  onUnmounted(() => session?.close());
+
+  return {
+    messages,
+    status,
+    send: (text: string) => session?.send(text),
+  };
+}
+```
+
+The `pumpEvents` function is a `for await` loop with a switch, just like the React reducer. Same shape applies to Svelte stores, Solid signals, MobX, whatever.
+
+## Node / Bun / Deno
+
+Same code. The package ships ESM + CJS and uses native `fetch` (Node ≥ 18).
+
+```ts
+import { createAgentClient } from "@agent-webkit/core";
+
+const client = createAgentClient({
+  baseUrl: process.env.AGENT_WEBKIT_URL!,
+  token: process.env.AGENT_WEBKIT_TOKEN,
+});
+
+const session = await client.createSession({ cwd: "/srv/work" });
+await session.send("Run lint and report failures");
+
+for await (const event of session.events()) {
+  if (event.event === "message_complete") console.log(textOf(event.data.message));
+  if (event.event === "result") break;
+}
+
+await session.close();
+```
+
+This is the right shape for Slack bots, GitHub Actions runners, scheduled jobs, or any non-interactive driver.
+
+## Cloudflare Workers
+
+Works. Native `fetch`, native streaming. Be aware of two limits:
+
+- Worker CPU time. Long agent turns may exceed `cpu_ms` — split the work or run on Durable Objects.
+- No persistent connections by default. The SSE auto-reconnect logic handles this, but you'll be issuing reconnects more frequently than from a long-lived browser tab.
+
+## Reconnect manually
+
+If you need to detach and re-attach (page reload, route change, etc.):
+
+```ts
+const lastEventId = session.lastEventId;
+session.detach(); // stop streaming, leave the session alive on the server
+// ... later
+const resumed = client.attachSession(session.id, { resumeFromEventId: lastEventId });
+for await (const event of resumed.events()) { /* ... */ }
+```
+
+`detach()` does not call `DELETE /sessions`. The session stays alive until idle eviction or an explicit `close()`.
+
+## Where to next
+
+- [Core API reference](/docs/reference/core-api) — every export.
+- [Wire protocol](/docs/reference/wire-protocol) — the on-wire event catalog.
+- [Resume & reconnect](/docs/guides/resume-and-reconnect) — the manual reconnect patterns.

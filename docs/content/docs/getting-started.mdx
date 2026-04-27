@@ -1,0 +1,114 @@
+---
+title: Getting started
+description: Five-minute walkthrough — Python server + React client, end to end.
+---
+
+By the end of this page you'll have a Python FastAPI server holding a Claude Agent SDK session and a React app talking to it over SSE.
+
+## Prerequisites
+
+- Python ≥ 3.10
+- Node ≥ 18
+- A `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` (or any auth the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/python) accepts).
+
+## 1. Stand up the server
+
+```bash
+pip install "agent-webkit-server[fastapi]"
+```
+
+Save this as `main.py`:
+
+```python
+import os
+import uvicorn
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.auth import AuthConfig
+
+app = create_app(auth=AuthConfig(disabled=True))
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
+```
+
+Then:
+
+```bash
+python main.py
+```
+
+You now have a server at `http://127.0.0.1:8000` that exposes the [agent-webkit wire protocol](/docs/reference/wire-protocol). For real deployments you'll want auth on — see the [FastAPI guide](/docs/guides/backend-fastapi).
+
+## 2. Drive it from React
+
+```bash
+npm install @agent-webkit/core @agent-webkit/react
+```
+
+```tsx title="App.tsx"
+import { useAgentSession } from "@agent-webkit/react";
+
+export default function App() {
+  const session = useAgentSession({ baseUrl: "http://127.0.0.1:8000" });
+
+  return (
+    <div>
+      <ul>
+        {session.messages.map((m) => (
+          <li key={m.id}>
+            <b>{m.role}</b>: {textOf(m)}
+          </li>
+        ))}
+      </ul>
+      <button
+        disabled={session.status !== "idle"}
+        onClick={() => session.send("Hello, who are you?")}
+      >
+        Send
+      </button>
+    </div>
+  );
+}
+
+function textOf(m: { content: { type: string; text?: string }[] }) {
+  return m.content.filter((b) => b.type === "text").map((b) => b.text).join("");
+}
+```
+
+That's it. `useAgentSession` opens a session on mount, opens the SSE stream, reconciles deltas into complete messages, and exposes a typed `send()` for user input.
+
+## 3. Handle a permission request
+
+When Claude wants to use a tool, the server emits a `permission_request` event. The hook surfaces it as `session.permissionRequest`:
+
+```tsx
+{session.permissionRequest && (
+  <div className="modal">
+    <p>Allow tool: <code>{session.permissionRequest.tool_name}</code>?</p>
+    <button onClick={() => session.respondToPermission("allow")}>Allow</button>
+    <button onClick={() => session.respondToPermission("deny")}>Deny</button>
+  </div>
+)}
+```
+
+[More on permissions →](/docs/guides/permissions)
+
+## 4. Handle `AskUserQuestion`
+
+Same pattern, separate state slot:
+
+```tsx
+{session.askUserQuestion && (
+  <Dialog
+    questions={session.askUserQuestion.questions}
+    onSubmit={(answers) => session.answerUserQuestion(answers)}
+  />
+)}
+```
+
+## What's next
+
+- **Make it production-ready** — [Deployment guide](/docs/guides/deployment): auth, eviction, observability, multi-host.
+- **Multi-tab support** — multi-subscriber fan-out is on by default; see [Resume & reconnect](/docs/guides/resume-and-reconnect).
+- **Persist sessions across hosts** — [Postgres sessions](/docs/guides/postgres-sessions).
+- **Build your own adapter** — drop the engine into Starlette, Litestar, raw ASGI: [Custom adapter guide](/docs/guides/backend-custom-adapter).

@@ -1,8 +1,9 @@
-# agent-webkit wire protocol — v1.0
+---
+title: Wire protocol
+description: The complete event/message catalog. protocol_version = "1.0".
+---
 
-This is the single source of truth for the protocol between L1 client (`@agent-webkit/core`)
-and any compliant server. The reference server in `server-reference/` is the canonical
-implementation.
+This is the single source of truth for the protocol between any L1 client (`@agent-webkit/core`) and any compliant server. The reference server in `agent-webkit-server` is the canonical implementation.
 
 `protocol_version = "1.0"`.
 
@@ -15,9 +16,7 @@ implementation.
 ## Auth
 
 - Bearer token in `Authorization: Bearer <token>` header.
-- Auth can be disabled per-server via `--no-auth` (or `AGENT_WEBKIT_NO_AUTH=1`). When disabled,
-  the browser-native `EventSource` may be used; when enabled, a fetch-based SSE polyfill is
-  required because `EventSource` cannot send custom headers.
+- Auth can be disabled per-server via `AuthConfig(disabled=True)`. When disabled, the browser-native `EventSource` may be used; when enabled, a fetch-based SSE polyfill is required because `EventSource` cannot send custom headers. `@agent-webkit/core` ships the polyfill by default.
 
 ## Endpoints
 
@@ -26,32 +25,35 @@ implementation.
 Create a new session. Spawns the underlying `ClaudeSDKClient` subprocess.
 
 Request body (all optional):
+
 ```json
 { "model": "claude-opus-4-7", "permission_mode": "default", "cwd": "/path/to/project" }
 ```
 
 Response:
+
 ```json
 { "session_id": "uuid", "protocol_version": "1.0" }
 ```
 
 ### `GET /sessions/{session_id}/stream`
 
-Server-Sent Events stream. Multi-subscriber: any number of clients may subscribe to the
-same session simultaneously, each with an independent cursor.
+Server-Sent Events stream. Multi-subscriber: any number of clients may subscribe to the same session simultaneously, each with an independent cursor.
 
 Headers honored:
+
 - `Last-Event-ID: <seq>` — replay from after that sequence number. Must be a non-negative integer; malformed values return `400 Bad Request`. Returns `412 Precondition Failed` if the requested seq has been evicted from the ring buffer.
 
 Events:
+
 - Every event has a numeric `id` (server-assigned monotonic seq), an `event` name, and JSON `data`.
 - A `:keepalive` SSE comment frame is emitted every 15s.
 
 ### `POST /sessions/{session_id}/input`
 
 Body is a single inbound message (see "Inbound message types" below).
-Returns `204 No Content` on success, `409 Conflict` if a `permission_response` /
-`question_response` arrives after another subscriber already replied.
+
+Returns `204 No Content` on success, `409 Conflict` if a `permission_response` / `question_response` arrives after another subscriber already replied.
 
 ### `DELETE /sessions/{session_id}`
 
@@ -73,8 +75,7 @@ All inbound messages are JSON objects with a `type` discriminator.
 
 `ContentBlock` is `{type:"text", text}` or `{type:"image", source:{type:"base64", media_type, data}}`.
 
-`correlation_id` for permissions is the SDK's `tool_use_id`. For AskUserQuestion it is the
-`tool_use_id` of the AskUserQuestion tool call.
+`correlation_id` for permissions is the SDK's `tool_use_id`. For AskUserQuestion it is the `tool_use_id` of the AskUserQuestion tool call.
 
 ## Outbound SSE event types
 
@@ -95,19 +96,15 @@ All inbound messages are JSON objects with a `type` discriminator.
 
 ### Race semantics
 
-For `permission_request` / `ask_user_question` / `hook_decision_request`: **first reply wins**.
-Subsequent replies for the same `correlation_id` get HTTP 409.
+For `permission_request` / `ask_user_question` / `hook_decision_request`: **first reply wins**. Subsequent replies for the same `correlation_id` get HTTP 409.
 
 ### Dual ID scheme
 
 - `id` (top-level SSE id) is a server-only monotonic seq. Used for `Last-Event-ID` resume.
-- `message_id`, `tool_use_id`, `correlation_id` are SDK-issued identifiers used for content
-  identity (delta → complete reconciliation, permission routing, etc.). Both coexist.
+- `message_id`, `tool_use_id`, `correlation_id` are SDK-issued identifiers used for content identity (delta → complete reconciliation, permission routing, etc.). Both coexist.
 
 ## Known limitations (v1)
 
-- Single-host session persistence (JSONL on local disk). Cross-host resume requires moving
-  the file or implementing a `SessionStore` adapter.
-- `interrupt()` does not drain the queue — server must finish draining `receive_messages()`
-  before accepting the next `query()`.
-- Hook-decision UI plumbing emits the event but L2 does not yet expose it as a hook.
+- Single-host live fan-out. Cross-host *failover* requires the Postgres adapter; cross-host *simultaneous* fan-out is not supported.
+- `interrupt()` does not drain the queue — the server must finish draining `receive_messages()` before accepting the next `query()`.
+- `hook_decision_request` is emitted but the L2 React hook does not yet expose it as a first-class state slot. Use the L1 client if you need it today.

@@ -1,0 +1,54 @@
+---
+title: FAQ
+description: Collected gotchas and frequently-hit edge cases.
+---
+
+## My second tab can't reply to a permission request
+
+Expected. Permission and question replies are **first-reply-wins**. The losing tab's `POST /input` returns `409 Conflict`. The L2 React hook surfaces this as a `conflict` state — render it as "another window already responded" and move on.
+
+## SSE drops events after a network blip
+
+Use `Last-Event-ID`. The default `@agent-webkit/core` client tracks the last seen `id` and sends it on reconnect. If you're rolling your own transport, do the same — the server replays everything after that seq.
+
+If you reconnect and get `412 Precondition Failed`, the gap was too big for the ring buffer (default 1000 events). Treat it as a hard reset: refetch the session messages out-of-band, or close the session.
+
+## My session disappeared
+
+Sessions idle-evict after 5 minutes (default) of no input *and* no subscribers. To keep one alive across long thinking pauses, either:
+
+- Keep a subscriber attached (the SSE stream itself counts).
+- Bump the idle timeout when constructing the engine.
+- Use Postgres-backed storage so the session resumes from disk on the next request.
+
+## Interrupt didn't stop the agent immediately
+
+`POST /input { type: "interrupt" }` calls `client.interrupt()` on the SDK, but the SDK still has to drain its receive loop before the next turn can start. The L2 hook represents this as a `cancelling` → `idle` transition. You'll typically see a few trailing events (a final `result`, sometimes a partial tool result) before things settle.
+
+## My `can_use_tool` callback never fires
+
+You probably wrote one in your server code AND configured agent-webkit. Don't. Agent-webkit installs its own `can_use_tool` to forward to the wire. If you need server-side gating *in addition*, run it inside the permission handler agent-webkit gives you, not as a competing callback.
+
+## I can't use `EventSource` with auth
+
+`EventSource` (browser native) cannot set custom headers. With auth enabled, use the fetch-based SSE polyfill that ships in `@agent-webkit/core` (this is the default). It supports `Authorization: Bearer <token>` and reconnect.
+
+## Multiple servers, one session
+
+Out of the box: no. A session lives in the Python process that created it. For multi-host setups:
+
+1. Use the [Postgres adapter](/docs/guides/postgres-sessions) so session metadata persists.
+2. Route requests for a given `session_id` to the host that owns it (sticky routing at your load balancer).
+3. On host failure, the next request rehydrates the session on the new host from Postgres — but the in-flight turn is lost.
+
+Live fan-out across hosts (two browsers on different servers seeing the same stream simultaneously) isn't supported and isn't on the roadmap. Stick the user's tabs to one host.
+
+## Versions
+
+- Wire protocol: pinned at `1.0`.
+- Pre-1.0 packages may break Python/JS APIs between minors. The wire is stable.
+- `agent-webkit-server` declares `claude-agent-sdk>=0.1.0,<0.2.0`. Bumping the SDK major requires a server release.
+
+## Where do I file a bug
+
+[github.com/BlitzJB/agent-webkit/issues](https://github.com/BlitzJB/agent-webkit/issues). Please include the wire event sequence (it's in the network panel) — that pins down whether the bug is in the server, the client, or your code.

@@ -1,0 +1,95 @@
+---
+title: Architecture
+description: Why agent-webkit is shaped the way it is — the design decisions, with rationale.
+---
+
+This page is for readers who want to understand *why* the project looks like this. If you just want to ship a feature, [Concepts](/docs/concepts) is enough.
+
+## The shape
+
+```
+┌──────────────────┐       HTTP+SSE       ┌──────────────────────┐       stdio        ┌──────────────────┐
+│   Browser /      │  ◄──── stream  ────  │  agent-webkit-server │  ◄── subprocess ── │  Claude Code CLI │
+│   Node / Deno    │  ──── POST  ────►    │   (FastAPI / ASGI)   │                    │  (Agent SDK)     │
+│ @agent-webkit/   │                       │                      │                    │                  │
+│  core + react    │                       │   ClaudeSDKClient    │                    │                  │
+└──────────────────┘                       └──────────────────────┘                    └──────────────────┘
+```
+
+Three layers, each with a job:
+
+1. **Claude Agent SDK** — speaks to the Claude Code CLI subprocess. Owns the model, tool execution, hooks, sub-agents.
+2. **agent-webkit-server** — keeps long-lived `ClaudeSDKClient`s alive, exposes them over HTTP+SSE, fans out to many subscribers, mediates permission RPC.
+3. **agent-webkit JS** — typed transport (`/core`) + framework hook (`/react`). Consumes the wire protocol, reconciles streaming deltas, manages permission/question UI state.
+
+## Why a separate server library at all
+
+The Agent SDK is a Python in-process API. Browsers can't invoke it directly. You need *something* in the middle, and that middle has surprising amounts of state:
+
+- A long-lived subprocess per session (spawning is slow — seconds).
+- A single in-flight `query()` per client.
+- An async `can_use_tool` callback that has to wait for a human response across the network.
+- Multiple browser tabs that want the same session.
+
+Once you do this 2-3 times in different products, the *right* answer is to extract it. That's agent-webkit-server.
+
+## Why SSE instead of WebSockets
+
+The traffic is overwhelmingly server → client streaming. Client → server is rare and bursty (user turns, permission replies). For this pattern:
+
+- **SSE** gives us automatic reconnect with `Last-Event-ID`, plays nicely with HTTP/2 multiplexing, traverses every proxy in the world, and degrades cleanly behind nginx.
+- **WebSockets** would require a custom resume scheme, run into more proxy issues, and offer no real benefit for one-way-heavy traffic.
+
+The downside is that `EventSource` (the browser-native API) doesn't support custom headers, so authenticated clients use a fetch-based polyfill. That's a known cost we accept.
+
+## Why "permission RPC" is a first-class wire concept
+
+The Agent SDK exposes `can_use_tool(tool, input, ctx)` as an async callback. If you naively wrap that and forward to a frontend, you have to:
+
+- Generate a correlation ID.
+- Park the callback (asyncio.Future).
+- Push an event to the right subscriber(s).
+- Accept a response and resolve the future.
+- Handle races between subscribers (multi-tab).
+- Handle the subscriber dying mid-decision.
+
+Every team that ships a Claude UI rewrites this. So we pulled it into the wire protocol with explicit `permission_request` / `permission_response` events and **first-reply-wins** semantics. Same machinery handles `AskUserQuestion`.
+
+## Why the ring buffer for resume
+
+Sessions can stream for tens of minutes. Wi-Fi blips happen. We need to be able to say "you saw up to event 247, here's 248 onwards" without persisting every event forever.
+
+The ring buffer (default 1000 events) gives us:
+
+- Bounded memory regardless of session length.
+- Fast resume (no DB hit on reconnect).
+- A clean failure mode (`412 Precondition Failed`) when the gap is too large to bridge — the client knows to refetch from scratch.
+
+The cost is that very long disconnects may fall out of the buffer. That's acceptable: sessions have an idle timeout anyway.
+
+## Why React isn't in the core package
+
+`@agent-webkit/core` is intentionally framework-agnostic. It runs in Node, Deno, Bun, Cloudflare Workers, the browser. Pulling React into it would force every consumer to ship React, which is wrong for a Vue app or a Node-side bot.
+
+`@agent-webkit/react` is a thin layer on top — under 500 lines — and a Vue/Svelte equivalent could be written the same way. See the [Vanilla JS guide](/docs/guides/frontend-vanilla) for the pattern.
+
+## Why two ID schemes
+
+We need both:
+
+- A **transport sequence** (the SSE `id` field) for resume. Server-assigned, monotonic, opaque.
+- **Content identity** (`message_id`, `tool_use_id`, `correlation_id`) for reconciling deltas, matching tool calls to results, and routing permission responses. SDK-assigned, semantic.
+
+Conflating them would break either resume (if seqs change across reconnects) or reconciliation (if content IDs aren't stable across deltas). They serve different purposes and they coexist.
+
+## Things we explicitly didn't build
+
+- **A general-purpose pub/sub** — fan-out is in-process. If you need cross-host fan-out, terminate sessions on the host that owns them and route at your load balancer. (Postgres-backed session storage is for *failover*, not for cross-host live fan-out.)
+- **Our own auth system** — agent-webkit-server takes a Bearer token and a verifier function. Bring your own JWT/OIDC/whatever.
+- **A UI component library** — the React hook gives you state. You render it. Opinionated UI is downstream of agent-webkit, not part of it.
+
+## Where to read next
+
+- [Wire protocol reference](/docs/reference/wire-protocol) — exact event/message catalog.
+- [Deployment guide](/docs/guides/deployment) — production concerns: scaling, eviction, observability.
+- [Postgres sessions](/docs/guides/postgres-sessions) — multi-host failover.

@@ -1,0 +1,172 @@
+---
+title: React frontend
+description: A complete walkthrough of useAgentSession() — messages, permissions, AskUserQuestion, errors, and reconnect.
+---
+
+If you're shipping a React app, `@agent-webkit/react` is what you want. It owns the SSE iterator, reconciles streaming deltas into a typed message list, and surfaces permission / question state slots as plain reactive state.
+
+```bash
+npm install @agent-webkit/react @agent-webkit/core
+```
+
+## The shape of a session
+
+```tsx
+import { useAgentSession } from "@agent-webkit/react";
+
+function Chat() {
+  const session = useAgentSession({
+    baseUrl: "https://api.example.com",
+    token: useAuthToken(),
+  });
+
+  return (
+    <>
+      <MessageList messages={session.messages} />
+      <Composer
+        onSend={session.send}
+        disabled={session.status !== "idle"}
+      />
+      <PermissionModal session={session} />
+      <QuestionDialog session={session} />
+      <ErrorBanner error={session.lastError} />
+    </>
+  );
+}
+```
+
+Everything you need is on the returned object. Full surface in [the API reference](/docs/reference/react-api).
+
+## Rendering messages
+
+`session.messages` is a discriminated union of three kinds: `user`, `assistant`, and `tool_result`. The reducer handles delta reconciliation for you — `streaming: true` means more text is on the way.
+
+```tsx
+function MessageList({ messages }: { messages: DisplayMessage[] }) {
+  return (
+    <ul>
+      {messages.map((m) => {
+        switch (m.kind) {
+          case "user":
+            return <UserBubble key={m.id} content={m.content} />;
+          case "assistant":
+            return (
+              <AssistantBubble
+                key={m.id}
+                content={m.content}
+                streaming={m.streaming}
+              />
+            );
+          case "tool_result":
+            return <ToolResult key={m.id} output={m.output} isError={m.is_error} />;
+        }
+      })}
+    </ul>
+  );
+}
+```
+
+The `assistant` block's `content` is `ContentBlock[]`. Filter to `type === "text"` for plain text, or render `tool_use` blocks inline if you want to show the agent reasoning about tool calls.
+
+## Permission UI
+
+When the model wants to use a tool, the server pauses and emits a `permission_request`. The hook places it on `session.pendingPermission`:
+
+```tsx
+function PermissionModal({ session }: { session: UseAgentSessionReturn }) {
+  const p = session.pendingPermission;
+  if (!p) return null;
+
+  return (
+    <Modal>
+      <h2>Allow tool: <code>{p.tool_name}</code>?</h2>
+      <pre>{JSON.stringify(p.input, null, 2)}</pre>
+      <button onClick={() => session.approve(p.correlation_id)}>Allow</button>
+      <button onClick={() => session.deny(p.correlation_id, { message: "Not now" })}>
+        Deny
+      </button>
+    </Modal>
+  );
+}
+```
+
+Things to note:
+
+- The slot clears as soon as the response is acked (or another tab wins the race).
+- `approve()` accepts `{ updatedInput }` if you want the user to edit the tool args before allowing.
+- `deny({ interrupt: true })` aborts the entire turn, not just this tool call.
+
+If two browser tabs race, the loser's `approve()` rejects. See [Permissions guide](/docs/guides/permissions) for the full pattern.
+
+## AskUserQuestion
+
+Same pattern, separate slot:
+
+```tsx
+function QuestionDialog({ session }: { session: UseAgentSessionReturn }) {
+  const q = session.pendingQuestion;
+  if (!q) return null;
+
+  return (
+    <Modal>
+      {q.questions.questions.map((item, i) => (
+        <Field key={i} item={item} />
+      ))}
+      <button onClick={() => session.answer(q.correlation_id, gatherAnswers())}>
+        Submit
+      </button>
+    </Modal>
+  );
+}
+```
+
+The double-nested `q.questions.questions` is the SDK's tool-input shape. Each item has a `question` string, a `header`, and `multiSelect` options.
+
+## Status
+
+`session.status` is your "is it busy?" signal:
+
+| Status                | Composer disabled? | Render                |
+| --------------------- | ------------------ | --------------------- |
+| `idle`                | no                 | composer enabled      |
+| `streaming`           | yes                | typing indicator      |
+| `awaiting_permission` | yes                | permission modal      |
+| `awaiting_question`   | yes                | question dialog       |
+| `awaiting_hook`       | yes                | (rare; use L1 for UI) |
+| `error`               | depends            | error banner          |
+
+## Errors
+
+`session.lastError` carries the most recent error event. Transport errors (network, transient) trigger automatic reconnect under the hood and don't surface here. What you'll see here is server-emitted protocol errors and fatal transport failures.
+
+Show, then clear when the user sends again — easiest UX.
+
+## Reconnects, multi-tab
+
+Free with the hook:
+
+- **Reconnect after Wi-Fi blip** — the underlying SSE iterator re-establishes using `Last-Event-ID`. Messages reconcile cleanly because `message_id` and `tool_use_id` are stable.
+- **Multiple tabs, same session** — pass the same `sessionId` to both. They share the stream; whichever responds to a permission first wins.
+
+To resume on a fresh page load:
+
+```tsx
+const session = useAgentSession({
+  baseUrl,
+  token,
+  sessionId: storedSessionId, // from localStorage, your URL, etc.
+  resumeFromEventId: storedLastEventId,
+});
+```
+
+If the gap is too big for the server's ring buffer, you'll get a fatal error and need to start a new session. See [Resume & reconnect](/docs/guides/resume-and-reconnect).
+
+## Manual control
+
+Set `autoStart: false` if you need to wait for some condition before opening the stream. You can also pre-construct an `AgentClient` with `createAgentClient` and pass it via `client` — useful for tests and for sharing one client across multiple hook instances.
+
+## Where to next
+
+- [Permissions guide](/docs/guides/permissions) — tool gates, `updatedInput`, deny + interrupt, race UX.
+- [Resume & reconnect](/docs/guides/resume-and-reconnect) — production reconnect patterns.
+- [React API reference](/docs/reference/react-api) — every field and method.

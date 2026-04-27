@@ -1,0 +1,133 @@
+---
+title: FastAPI backend
+description: Stand up a production agent-webkit server with FastAPI — auth, custom routes, and configuration.
+---
+
+The fastest way to expose the Claude Agent SDK over HTTP+SSE is the bundled FastAPI adapter.
+
+```bash
+pip install "agent-webkit-server[fastapi]"
+```
+
+## The minimum
+
+```python
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.auth import AuthConfig
+
+app = create_app(auth=AuthConfig.from_env())
+```
+
+`create_app` returns a `FastAPI` instance with the wire protocol routes mounted at the root: `POST /sessions`, `GET /sessions/{id}/stream`, `POST /sessions/{id}/input`, `DELETE /sessions/{id}`.
+
+Run it any way you'd run a FastAPI app:
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+## Authentication
+
+`AuthConfig` is the only auth knob you need:
+
+```python
+# Static Bearer token (good for service-to-service)
+AuthConfig(token="hunter2")
+
+# Read from env: AGENT_WEBKIT_AUTH_TOKEN or AGENT_WEBKIT_NO_AUTH=1
+AuthConfig.from_env()
+
+# Disabled (DEV ONLY)
+AuthConfig(disabled=True)
+```
+
+For real systems you usually want JWTs / OIDC instead of a shared secret. The recommended pattern: validate at your edge (load balancer, reverse proxy, FastAPI middleware) and pass through a stable token to agent-webkit. Or, mount your own auth dependency on the routes — FastAPI's `Depends` machinery composes cleanly with the routes `create_app` registers.
+
+## Adding your own routes
+
+`app` is a regular `FastAPI` instance. Register more routes as you would normally:
+
+```python
+from fastapi import Depends
+
+app = create_app(auth=AuthConfig.from_env())
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
+
+@app.get("/me")
+def me(user = Depends(get_user)):
+    return {"user_id": user.id}
+```
+
+The agent-webkit routes don't conflict with anything outside `/sessions`.
+
+## CORS
+
+The adapter doesn't add CORS middleware (intentionally — it's deployment-specific). For browser clients on a different origin:
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://app.example.com"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
+    expose_headers=["Last-Event-ID"],
+)
+```
+
+`Last-Event-ID` in both `allow_headers` and `expose_headers` is required for resume to work.
+
+## Custom SDK construction
+
+The default `sdk_factory` builds a standard `ClaudeSDKClient`. Override it to inject SDK options (custom MCP servers, hooks, system prompt, etc.):
+
+```python
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
+
+async def my_sdk_factory(*, model=None, permission_mode=None, cwd=None):
+    options = ClaudeAgentOptions(
+        model=model,
+        permission_mode=permission_mode,
+        cwd=cwd,
+        system_prompt="You are a code review assistant.",
+        mcp_servers={"linear": {"command": "linear-mcp"}},
+    )
+    client = ClaudeSDKClient(options)
+    await client.connect()
+    return client
+
+app = create_app(auth=AuthConfig.from_env(), sdk_factory=my_sdk_factory)
+```
+
+Anything reachable via `ClaudeAgentOptions` is reachable from here.
+
+## Reverse-proxy notes
+
+SSE has a few well-known foot-guns behind proxies:
+
+- **Buffering off.** Disable response buffering. Nginx: `proxy_buffering off; proxy_request_buffering off; proxy_read_timeout 600s;`
+- **Compression off for SSE.** `gzip off;` in the SSE location, or set `Cache-Control: no-transform`.
+- **Idle timeouts.** Bump them past your max session length, or rely on the 15s `:keepalive` frame to keep connections warm. ALBs default to 60s; bump to 600s+.
+
+## Observability
+
+`create_app` doesn't ship its own structured logging. Plug in standard FastAPI middleware (`structlog`, OTel, sentry-fastapi) — they all work as expected. Useful labels:
+
+- `session_id` (extract from path)
+- `event_seq` (the SSE `id` field, for resume diagnostics)
+- `correlation_id` (for permission/question races)
+
+## Persistent storage
+
+The default registry is in-memory. For multi-host failover, swap in the Postgres adapter — see [Postgres sessions](/docs/guides/postgres-sessions).
+
+## Where to next
+
+- [Deployment guide](/docs/guides/deployment) — sizing, scaling, eviction.
+- [Server API reference](/docs/reference/server-api) — every Python entry point.
+- [Custom adapter](/docs/guides/backend-custom-adapter) — Starlette, Litestar, raw ASGI.

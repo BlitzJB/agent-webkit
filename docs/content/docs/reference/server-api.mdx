@@ -1,0 +1,127 @@
+---
+title: "agent-webkit-server API"
+description: Python entry points, config classes, and adapters.
+---
+
+```bash
+pip install "agent-webkit-server[fastapi]"
+# Postgres adapter:
+pip install "agent-webkit-server[fastapi,postgres]"
+```
+
+## `create_app(...)` — FastAPI adapter
+
+```python
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.auth import AuthConfig
+
+app = create_app(auth=AuthConfig.from_env())
+```
+
+Signature:
+
+```python
+def create_app(
+    *,
+    auth: AuthConfig | None = None,
+    sdk_factory: SDKFactory = _real_sdk_factory,
+) -> FastAPI: ...
+```
+
+| Param         | Notes                                                                                |
+| ------------- | ------------------------------------------------------------------------------------ |
+| `auth`        | Auth policy. Defaults to `AuthConfig.from_env()` (reads `AGENT_WEBKIT_AUTH_TOKEN`).  |
+| `sdk_factory` | Override how `ClaudeSDKClient` is constructed. Useful for tests and for injecting custom SDK options. |
+
+## `AuthConfig`
+
+```python
+from agent_webkit_server.auth import AuthConfig
+
+AuthConfig(token="hunter2")          # require this Bearer token
+AuthConfig(disabled=True)            # no auth (dev only)
+AuthConfig.from_env()                # read AGENT_WEBKIT_AUTH_TOKEN / AGENT_WEBKIT_NO_AUTH
+```
+
+| Attribute  | Type            |
+| ---------- | --------------- |
+| `token`    | `Optional[str]` |
+| `disabled` | `bool`          |
+
+## `SessionConfig`
+
+Forwarded to the `ClaudeSDKClient` per session.
+
+```python
+from agent_webkit_server.session import SessionConfig
+
+SessionConfig(model="claude-opus-4-7", permission_mode="default", cwd="/work")
+```
+
+All fields optional.
+
+## `SessionRegistry`
+
+The in-memory registry of live sessions. You typically never touch this — `create_app` constructs and owns one. Reach for it if you're writing a custom adapter.
+
+```python
+from agent_webkit_server.session import SessionRegistry
+
+registry = SessionRegistry(sdk_factory, idle_timeout_s=300.0)
+registry.start_reaper()
+
+session = registry.create(SessionConfig(...))
+registry.get(session_id)
+registry.remove(session_id)
+await registry.shutdown()
+```
+
+| Param            | Default | Notes                                                                |
+| ---------------- | ------- | -------------------------------------------------------------------- |
+| `sdk_factory`    | —       | Required. Async callable that builds and returns a `ClaudeSDKClient`. |
+| `idle_timeout_s` | `300.0` | Seconds since last input *and* last subscriber before eviction.      |
+
+## `EventLog` — the ring buffer
+
+```python
+from agent_webkit_server.event_log import EventLog, EvictedError
+
+log = EventLog(max_size=1000)
+```
+
+| Method / property              | Notes                                                                  |
+| ------------------------------ | ---------------------------------------------------------------------- |
+| `append(event, data)`          | Append a new event. Returns the assigned `LoggedEvent`.                |
+| `subscribe(after_seq=0)`       | Async iterator. Replays buffered events `> after_seq`, then live tails.|
+| `last_seq`                     | Highest seq assigned so far.                                           |
+| `close()`                      | Closes all subscribers with a terminal `done` event.                   |
+| `EvictedError`                 | Raised by `subscribe` when `after_seq` is older than the ring window.  |
+
+`max_size` is the most important production knob: bigger = longer disconnects survive resume, but more memory per session.
+
+## Postgres adapter
+
+```python
+from agent_webkit_server.adapters.pg_session_store import PgSessionStore
+
+store = await PgSessionStore.connect("postgresql://...", min_size=1, max_size=10)
+# or, with an existing pool:
+store = PgSessionStore.from_pool(my_pool)
+```
+
+| Class method                         | Notes                                          |
+| ------------------------------------ | ---------------------------------------------- |
+| `connect(dsn, *, min_size, max_size)` | Open a new asyncpg pool.                       |
+| `from_pool(pool)`                    | Reuse an existing `asyncpg.Pool`.              |
+
+Implements the `SessionStore` protocol: `append`, `load`, `close`. See the [Postgres sessions guide](/docs/guides/postgres-sessions).
+
+## Constants
+
+```python
+from agent_webkit_server import PROTOCOL_VERSION  # "1.0"
+```
+
+## Models
+
+Request and response bodies live in `agent_webkit_server.models` and are Pydantic models. The shapes match the [wire protocol](/docs/reference/wire-protocol). You can import them in tests or to build a non-FastAPI adapter — see [Custom adapter guide](/docs/guides/backend-custom-adapter).

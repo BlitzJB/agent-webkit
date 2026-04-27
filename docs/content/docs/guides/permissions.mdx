@@ -1,0 +1,123 @@
+---
+title: Permissions
+description: Production patterns for tool gates — approve/deny, edit-before-allow, deny-and-interrupt, race UX.
+---
+
+Tool permission UX is one of the trickiest parts of any agent product. agent-webkit handles the wire-level mechanics — fan-out, correlation, races — and gives you the state. This page is about the patterns on top.
+
+## The core flow
+
+When the model wants to use a tool that requires approval, the SDK calls `can_use_tool(tool, input, ctx)`. agent-webkit forwards this as a `permission_request` event. Until your client responds, the server is parked on an `asyncio.Future`.
+
+```
+SDK → Server: can_use_tool                    [server holds Future]
+Server → Client: SSE permission_request        [pendingPermission set]
+Client → Server: POST /input permission_response
+Server → SDK: PermissionResultAllow / Deny     [Future resolved]
+SDK continues query()
+```
+
+The L2 React hook surfaces this as `session.pendingPermission`. The L1 JS client surfaces it as a `permission_request` event in the SSE iterator.
+
+## Allow
+
+The simplest case:
+
+```tsx
+<button onClick={() => session.approve(p.correlation_id)}>Allow</button>
+```
+
+The tool runs with the input the model proposed, unmodified.
+
+## Deny with a reason
+
+```tsx
+<button
+  onClick={() => session.deny(p.correlation_id, {
+    message: "I don't want to send the user's email here",
+  })}
+>
+  Deny
+</button>
+```
+
+The `message` is shown to the model. It will typically apologize and try a different approach. The current turn keeps going.
+
+## Deny + abort the turn
+
+Sometimes you want the agent to *stop completely* when a tool is denied — for example, if the wrong tool was an early sign that the agent misread the task.
+
+```tsx
+<button
+  onClick={() => session.deny(p.correlation_id, {
+    message: "Aborting — wrong tool",
+    interrupt: true,
+  })}
+>
+  Stop
+</button>
+```
+
+`interrupt: true` is **deny-only**. Sending it with `allow` is invalid (the wire protocol rejects it). You'll see a `result` event shortly after, then `idle`.
+
+## Allow with edits
+
+Power-user UX: let the human tweak the tool input before allowing.
+
+```tsx
+<button
+  onClick={() => session.approve(p.correlation_id, {
+    updatedInput: { ...p.input, query: editedQuery },
+  })}
+>
+  Allow with my edits
+</button>
+```
+
+The tool runs with `updatedInput` instead of the model's original input. The model sees this in the next turn and can react accordingly.
+
+This is the right pattern for tools like "send email" or "file ticket" — let the user fix typos before firing.
+
+## Race semantics
+
+Two tabs both prompt the user. Both submit a response. **First-reply wins.** The losing tab's `approve()` rejects with a 409.
+
+Recommended UX: don't try to reconcile, just clean up. The reducer already clears `pendingPermission` for both tabs as soon as the winning response is acked over SSE. Your modal's `null` check handles the rest.
+
+```tsx
+useEffect(() => {
+  if (!session.pendingPermission) {
+    closeModalGracefully(); // already responded somewhere
+  }
+}, [session.pendingPermission]);
+```
+
+If you really want to show "another window already responded", you can detect the 409 from your `approve` / `deny` call and surface a brief toast.
+
+## Permission modes
+
+You can change the agent's permission mode mid-session:
+
+```ts
+await session.setPermissionMode("acceptEdits"); // or "default", "bypassPermissions", ...
+```
+
+This is forwarded to the SDK and changes how `can_use_tool` is invoked for the *next* tool call. It does not retroactively apply to a request currently parked on a Future.
+
+Use this for "trust this agent for the next 5 minutes" UX. Reset to `"default"` afterwards.
+
+## Server-side gates
+
+Sometimes you want certain tools approved automatically without a roundtrip to the user. Don't do this by writing a competing `can_use_tool` — agent-webkit installs its own. Instead, intercept inside your server. The simplest pattern: subclass the engine's permission handler, or pre-approve in your custom `sdk_factory` with a wrapper that auto-approves whitelisted tools and forwards everything else.
+
+If you find yourself doing a lot of this, file an issue — first-class server-side allow lists are on the roadmap.
+
+## Logging
+
+For audit trails, log every `permission_request` and the eventual decision (correlation_id, tool, decision, who decided). The correlation_id is `tool_use_id`, which appears in subsequent `tool_use` and `tool_result` events — good for stitching traces together.
+
+## Where to next
+
+- [Wire protocol — Race semantics](/docs/reference/wire-protocol#race-semantics)
+- [React API — PendingPermission](/docs/reference/react-api#pendingpermission)
+- [FAQ — second tab can't reply](/docs/faq#my-second-tab-cant-reply-to-a-permission-request)

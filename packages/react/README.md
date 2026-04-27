@@ -1,36 +1,52 @@
 # @agent-webkit/react
 
-L2 React abstractions over `@agent-webkit/core`.
+React hook for the [agent-webkit](https://agent-webkit-docs.vercel.app) wire protocol. Streams Claude Agent SDK sessions into typed reactive state.
+
+```bash
+npm install @agent-webkit/react @agent-webkit/core
+```
+
+## Use
 
 ```tsx
 import { useAgentSession } from "@agent-webkit/react";
 
-export function Chat() {
-  const {
-    messages, status, pendingPermission, pendingQuestion,
-    send, interrupt, approve, deny, answer,
-  } = useAgentSession({ baseUrl: "http://localhost:8000", token: "..." });
+function Chat() {
+  const session = useAgentSession({ baseUrl: "https://api.example.com", token });
 
   return (
-    <div>
-      {messages.map((m) => <Bubble key={m.id} m={m} />)}
-      {pendingPermission && (
-        <PermissionPrompt
-          req={pendingPermission}
-          onAllow={() => approve(pendingPermission.correlation_id)}
-          onDeny={() => deny(pendingPermission.correlation_id)}
-        />
+    <>
+      <Messages list={session.messages} />
+      <Composer
+        disabled={session.status !== "idle"}
+        onSend={session.send}
+      />
+      {session.pendingPermission && (
+        <Modal>
+          <button onClick={() => session.approve(session.pendingPermission!.correlation_id)}>
+            Allow
+          </button>
+        </Modal>
       )}
-      {pendingQuestion && (
-        <QuestionPrompt
-          q={pendingQuestion}
-          onAnswer={(answers) => answer(pendingQuestion.correlation_id, answers)}
-        />
-      )}
-    </div>
+    </>
   );
 }
 ```
 
-The hook handles delta→complete reconciliation by `message_id`, race-resolution UI states,
-and reconnect with `Last-Event-ID`.
+What you get for free:
+
+- **Delta reconciliation** into a typed `messages` list.
+- **Permission UI states** via `pendingPermission` + `approve` / `deny`.
+- **`AskUserQuestion`** routing via `pendingQuestion` + `answer`.
+- **Reconnect** transparently after Wi-Fi blips.
+- Multi-tab race semantics handled.
+
+## Docs
+
+- [React guide](https://agent-webkit-docs.vercel.app/docs/guides/frontend-react)
+- [React API reference](https://agent-webkit-docs.vercel.app/docs/reference/react-api)
+- [Permissions guide](https://agent-webkit-docs.vercel.app/docs/guides/permissions)
+
+## License
+
+MIT

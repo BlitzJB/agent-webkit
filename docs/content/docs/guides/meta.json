@@ -1,0 +1,13 @@
+{
+  "title": "Guides",
+  "pages": [
+    "frontend-react",
+    "frontend-vanilla",
+    "backend-fastapi",
+    "backend-custom-adapter",
+    "permissions",
+    "resume-and-reconnect",
+    "postgres-sessions",
+    "deployment"
+  ]
+}

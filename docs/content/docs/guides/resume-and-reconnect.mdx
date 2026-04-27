@@ -1,0 +1,97 @@
+---
+title: Resume & reconnect
+description: How agent-webkit survives Wi-Fi blips, page reloads, and idle disconnects — and how to size the ring buffer.
+---
+
+The SSE stream is the live tail of a per-session event log. Every event has a server-assigned monotonic seq. When a client reconnects with `Last-Event-ID: <seq>`, the server replays everything after that seq, then transitions to live tailing.
+
+This is the same mechanism that powers multi-tab fan-out — each subscriber tracks its own cursor.
+
+## What happens on a Wi-Fi blip
+
+The L1 transport (`@agent-webkit/core`) tracks the last seen event id. On a transient connection failure:
+
+1. The fetch-based SSE polyfill catches the error.
+2. It reconnects to `GET /sessions/{id}/stream` with `Last-Event-ID: <last_seq>`.
+3. The server's `EventLog.subscribe(after_seq=last_seq)` yields buffered events first, then live ones.
+4. The client iterator keeps going as if nothing happened.
+
+The L2 React hook does this transparently. You don't write any code.
+
+## What happens on a page reload
+
+You lose the in-memory client. To rejoin:
+
+```tsx
+const session = useAgentSession({
+  baseUrl,
+  token,
+  sessionId: storedSessionId,
+  resumeFromEventId: storedLastEventId,
+});
+```
+
+What to persist:
+
+- `sessionId` — required. Without it, you'd create a new session.
+- `resumeFromEventId` — the last `id` you saw before unload. Without it, the server replays the entire ring buffer (up to 1000 events by default).
+
+`localStorage` works for single-tab. For multi-tab, write through `BroadcastChannel` so all tabs share the latest cursor.
+
+## When resume fails
+
+If `Last-Event-ID` is older than the oldest event still in the ring buffer, the server returns `412 Precondition Failed`. This is irrecoverable for that subscriber — the gap can't be bridged.
+
+The L2 hook surfaces this as a fatal error in `lastError`. You should:
+
+1. Show the user "Reconnecting…" then "Couldn't resume — starting fresh".
+2. Discard `sessionId` and `resumeFromEventId`.
+3. Create a new session.
+
+If you'd rather not lose the message history, fetch it out-of-band before discarding — see "Fetching session state" below.
+
+## Sizing the ring buffer
+
+The default is 1000 events per session. Events are small (tool calls, deltas, results), so a session might burn through 1000 events in 10–30 minutes of active streaming. After that, the oldest events fall off.
+
+You can tune this when constructing the engine. The trade:
+
+| Buffer size | Tolerates up to       | Memory per session |
+| ----------- | --------------------- | ------------------ |
+| 200         | a few minutes         | ~20 KB             |
+| 1000        | 10–30 minutes typical | ~100 KB            |
+| 10000       | hours                 | ~1 MB              |
+
+For most products: 1000 is fine. Bump to 5000–10000 if your users routinely come back hours later.
+
+## Idle eviction interacts with resume
+
+A session can be evicted by the idle reaper (default 5 minutes since last input *and* last subscriber). If that happens, your `Last-Event-ID` resume gets a `404 Not Found`, not a `412` — the session is gone entirely.
+
+To prevent eviction during long thinking pauses, keep a subscriber attached. The SSE stream itself counts; if a tab is open with the stream live, the session won't idle out even if the user is AFK. So in practice, this is mostly a concern for fully-disconnected reloads (closed laptop, lost device).
+
+If you need sessions to survive arbitrarily long disconnects, use the [Postgres adapter](/docs/guides/postgres-sessions) with a longer `idle_timeout_s`.
+
+## Fetching session state
+
+There's currently no `GET /sessions/{id}/messages` endpoint. The event stream is the source of truth — clients are expected to reconstruct from SSE.
+
+If you need to *display* prior messages after a 412 / 404, two options:
+
+1. **Persist your reduced state client-side.** Save `messages: DisplayMessage[]` to IndexedDB on every change. On reload, hydrate from there even before reconnecting.
+2. **Persist server-side via your own endpoints.** Mount a custom route that pulls from your audit log / DB.
+
+Option 1 is by far the simplest and is what we recommend for most products.
+
+## `detach()` vs `close()`
+
+- `detach()` stops the SSE iterator but leaves the session alive on the server.
+- `close()` calls `DELETE /sessions/{id}` — the session is gone for everyone.
+
+For "minimize this conversation, I might come back": `detach`. For "permanently end this conversation": `close`.
+
+## Where to next
+
+- [Wire protocol — `Last-Event-ID`](/docs/reference/wire-protocol#get-sessionssession_idstream)
+- [Postgres sessions](/docs/guides/postgres-sessions) — for cross-host / very long-lived sessions.
+- [Deployment guide](/docs/guides/deployment) — sizing, eviction policy, observability.
