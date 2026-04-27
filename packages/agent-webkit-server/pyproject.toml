@@ -9,7 +9,8 @@ description = "Server-side toolkit for the Claude Agent SDK over HTTP+SSE: sessi
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-authors = [{ name = "agent-webkit" }]
+authors = [{ name = "BlitzJB" }]
+keywords = ["claude", "anthropic", "agent-sdk", "fastapi", "sse"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -20,8 +21,8 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 dependencies = [
-    "pydantic>=2.0",
-    "claude-agent-sdk>=0.1.0",
+    "pydantic>=2.0,<3.0",
+    "claude-agent-sdk>=0.1.0,<0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -43,6 +44,9 @@ dev = [
 
 [project.urls]
 Homepage = "https://github.com/BlitzJB/agent-webkit"
+Documentation = "https://github.com/BlitzJB/agent-webkit#readme"
+Source = "https://github.com/BlitzJB/agent-webkit"
+Issues = "https://github.com/BlitzJB/agent-webkit/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_webkit_server"]

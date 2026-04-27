@@ -41,10 +41,10 @@ describe.skipIf(skip)("L1 against real Python server", () => {
       VENV_PYTHON,
       ["-c", `
 import sys, asyncio
-sys.path.insert(0, '${REPO_ROOT}server-reference')
+sys.path.insert(0, '${REPO_ROOT}packages/agent-webkit-server/src')
 sys.path.insert(0, '${REPO_ROOT}')
-from server.main import create_app
-from server.auth import AuthConfig
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.auth import AuthConfig
 from tests.fake_claude_sdk import FakeClaudeSDKClient
 from pathlib import Path
 import uvicorn

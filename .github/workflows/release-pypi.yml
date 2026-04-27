@@ -1,0 +1,86 @@
+name: Release (PyPI)
+
+on:
+  push:
+    tags: ["py-v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+concurrency:
+  group: release-pypi-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write  # required for PyPI Trusted Publishing (OIDC)
+
+jobs:
+  build:
+    name: Build agent-webkit-server sdist + wheel
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.target.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: pip install --upgrade build twine
+      - name: Build
+        run: |
+          cd packages/agent-webkit-server
+          python -m build
+      - name: Twine check
+        run: twine check packages/agent-webkit-server/dist/*
+      - name: Smoke-import the wheel in a clean venv
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install --upgrade pip
+          /tmp/smoke/bin/pip install packages/agent-webkit-server/dist/*.whl
+          /tmp/smoke/bin/python -c "import agent_webkit_server, agent_webkit_server.adapters; print('ok', agent_webkit_server.PROTOCOL_VERSION)"
+      - name: Decide target
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ inputs.target }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=pypi" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: packages/agent-webkit-server/dist/
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    if: needs.build.outputs.target == 'testpypi'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    name: Publish to PyPI
+    if: needs.build.outputs.target == 'pypi'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1

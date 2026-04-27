@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  js:
+    name: JS — typecheck + test + build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r --filter "./packages/core" --filter "./packages/react" typecheck
+      - run: pnpm -r --filter "./packages/core" --filter "./packages/react" test
+      - run: pnpm -r --filter "./packages/core" --filter "./packages/react" build
+
+  python:
+    name: Python — unit + contract + properties
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentwebkit
+          POSTGRES_PASSWORD: agentwebkit
+          POSTGRES_DB: agentwebkit_test
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U agentwebkit"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install "./packages/agent-webkit-server[fastapi,postgres,dev]"
+      - name: Run tests
+        env:
+          PG_USE_DEFAULT: "1"
+        run: |
+          pytest tests/unit tests/contract tests/properties tests/integration/test_pg_session_store.py --no-cov -q
