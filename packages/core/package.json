@@ -1,17 +1,25 @@
 {
   "name": "@agent-webkit/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "L1 vanilla JS SDK for the agent-webkit wire protocol. Isomorphic (browser/Node/Deno/Bun).",
   "license": "MIT",
   "author": "BlitzJB",
   "homepage": "https://github.com/BlitzJB/agent-webkit#readme",
-  "bugs": { "url": "https://github.com/BlitzJB/agent-webkit/issues" },
+  "bugs": {
+    "url": "https://github.com/BlitzJB/agent-webkit/issues"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/BlitzJB/agent-webkit.git",
     "directory": "packages/core"
   },
-  "keywords": ["claude", "agent-sdk", "sse", "anthropic", "agent"],
+  "keywords": [
+    "claude",
+    "agent-sdk",
+    "sse",
+    "anthropic",
+    "agent"
+  ],
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -22,7 +30,11 @@
       "import": "./dist/index.js"
     }
   },
-  "files": ["dist", "LICENSE", "README.md"],
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "engines": {
     "node": ">=18"
   },
