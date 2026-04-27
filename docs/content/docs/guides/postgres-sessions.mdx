@@ -40,7 +40,7 @@ store = await PgSessionStore.connect(os.environ["DATABASE_URL"], min_size=1, max
 app = create_app(auth=AuthConfig.from_env(), session_store=store)
 ```
 
-Note: the `session_store` kwarg is added in the same release as the Postgres adapter. If your version doesn't accept it, see the [server API reference](/docs/reference/server-api) for the current wiring.
+The default `sdk_factory` forwards `session_store` to `ClaudeAgentOptions`, so the SDK persists session state through it automatically. If you supply your own `sdk_factory`, you're responsible for wiring `session_store` into your own `ClaudeAgentOptions`.
 
 ## Schema
 

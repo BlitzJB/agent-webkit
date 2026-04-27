@@ -24,14 +24,16 @@ Signature:
 def create_app(
     *,
     auth: AuthConfig | None = None,
-    sdk_factory: SDKFactory = _real_sdk_factory,
+    sdk_factory: SDKFactory | None = None,
+    session_store: SessionStore | None = None,
 ) -> FastAPI: ...
 ```
 
-| Param         | Notes                                                                                |
-| ------------- | ------------------------------------------------------------------------------------ |
-| `auth`        | Auth policy. Defaults to `AuthConfig.from_env()` (reads `AGENT_WEBKIT_AUTH_TOKEN`).  |
-| `sdk_factory` | Override how `ClaudeSDKClient` is constructed. Useful for tests and for injecting custom SDK options. |
+| Param           | Notes                                                                                |
+| --------------- | ------------------------------------------------------------------------------------ |
+| `auth`          | Auth policy. Defaults to `AuthConfig.from_env()` (reads `AGENT_WEBKIT_AUTH_TOKEN`).  |
+| `sdk_factory`   | Override how `ClaudeSDKClient` is constructed. Useful for tests and for injecting custom SDK options. When set, `session_store` is ignored — wire it into your own factory. |
+| `session_store` | Forwarded to `ClaudeAgentOptions(session_store=...)` by the default factory. Pair with the bundled `PgSessionStore` for failover. |
 
 ## `AuthConfig`
 

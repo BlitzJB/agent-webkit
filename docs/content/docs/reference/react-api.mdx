@@ -30,7 +30,7 @@ const session = useAgentSession({
 | `resumeFromEventId`  | `string`              | —       | Resume from a specific SSE seq.           |
 | `create`             | `CreateSessionOptions`| —       | Forwarded to `POST /sessions` when creating. |
 | `client`             | `AgentClient`         | —       | Inject a pre-built client (testing).      |
-| `autoStart`          | `boolean`             | `true`  | If `false`, you call `session.start()` manually. |
+| `autoStart`          | `boolean`             | `true`  | If `false`, the hook does nothing on mount. Flip back to `true` when you're ready to open the session — useful for gating on auth, feature flags, or a user gesture. |
 
 ### Return value
 

@@ -163,7 +163,7 @@ If the gap is too big for the server's ring buffer, you'll get a fatal error and
 
 ## Manual control
 
-Set `autoStart: false` if you need to wait for some condition before opening the stream. You can also pre-construct an `AgentClient` with `createAgentClient` and pass it via `client` — useful for tests and for sharing one client across multiple hook instances.
+Set `autoStart: false` if you need to gate the session on a condition (auth ready, feature flag, user gesture). Flip it back to `true` when you're ready and the hook will open the session. You can also pre-construct an `AgentClient` with `createAgentClient` and pass it via `client` — useful for tests and for sharing one client across multiple hook instances.
 
 ## Where to next
 
