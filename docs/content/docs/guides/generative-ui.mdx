@@ -1,0 +1,174 @@
+---
+title: Generative UI
+description: Define typed components on the server, let the agent invoke them as tools, render them as React components on the client.
+---
+
+agent-webkit's **generative UI** lets the model render rich UI to the user instead of always replying in prose. You define the components as typed schemas server-side; the model gets to "call" them like tools; the frontend matches incoming `tool_use` events to renderers and mounts the corresponding React component with validated props.
+
+The whole feature is an opt-in extra — nothing changes about agent-webkit's existing protocol if you don't use it.
+
+## How it works
+
+```
+┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
+│ pydantic.Model  │  ───→   │  in-process MCP │  ───→   │ tool_use event  │
+│  (server)       │         │  server tool    │         │  on the wire    │
+└─────────────────┘         └─────────────────┘         └─────────────────┘
+                                                                  │
+                                                                  ▼
+                                                       ┌─────────────────┐
+                                                       │ GenUIStream     │
+                                                       │ matches +       │
+                                                       │ dispatches      │
+                                                       └────────┬────────┘
+                                                                ▼
+                                                       ┌─────────────────┐
+                                                       │ React renderer  │
+                                                       └─────────────────┘
+```
+
+1. You declare components with `pydantic.BaseModel` and register them with `GenUIRegistry`.
+2. The registry mounts an in-process MCP server (no IPC) where each component becomes a tool whose input schema is the component's props.
+3. `create_app(genui=...)` exposes `GET /genui/schema` and auto-allows the render tools (they're side-effect-free).
+4. On the client, `useGenerativeUI` fetches the schema, taps the wire-event stream, and dispatches each matching `tool_use` to a React renderer keyed by `short_name`.
+
+## Server: registering components
+
+```python
+from pydantic import BaseModel, Field
+from agent_webkit_server.adapters.fastapi import create_app
+from agent_webkit_server.extras.genui import GenUIRegistry
+
+
+class WeatherCard(BaseModel):
+    """Display the current weather for a location."""
+
+    location: str
+    temperature_f: float
+    condition: str | None = Field(default=None, description="e.g. 'sunny', 'cloudy'")
+
+
+class PricingPlan(BaseModel):
+    name: str
+    price: float
+    features: list[str] = Field(default_factory=list)
+
+
+class PricingTable(BaseModel):
+    """Side-by-side pricing comparison."""
+
+    plans: list[PricingPlan]
+
+
+registry = GenUIRegistry()
+registry.register(WeatherCard)
+registry.register(PricingTable)
+
+app = create_app(genui=registry)
+```
+
+That's it on the server. `create_app` will:
+
+- Mount `GET /genui/schema` (no auth — the schema is a public client contract).
+- Stand up an in-process MCP server named `genui` exposing one tool per component.
+- Add the qualified tool names (e.g. `mcp__genui__render_weather_card`) to `allowed_tools` so they don't trigger permission prompts.
+- Append a system-prompt nudge so the model knows it can call these to render UI.
+
+### Customizing the registry
+
+```python
+registry = GenUIRegistry(
+    server_name="ui",        # changes mcp__ui__... in the qualified name
+    prefix="show_",          # tool names become show_<short_name>
+    system_prompt="...",     # override the bundled nudge entirely; "" disables it
+)
+```
+
+The pydantic docstring becomes the tool description by default. Pass `description=` explicitly to override:
+
+```python
+registry.register(WeatherCard, description="Render a weather card for the user.")
+```
+
+## Client: rendering components
+
+```tsx
+import { useAgentSession, useGenerativeUI } from "@agent-webkit/react";
+
+function App() {
+  const ui = useGenerativeUI({
+    schemaUrl: "/genui/schema",
+    renderers: {
+      weather_card: (props) => <WeatherCard {...props} />,
+      pricing_table: (props) => <PricingTable {...props} />,
+    },
+  });
+
+  const session = useAgentSession({
+    baseUrl: "/",
+    onEvent: ui.onEvent,   // pipe wire events into the GenUI dispatcher
+  });
+
+  return (
+    <>
+      <MessageList messages={session.messages} />
+      <div>{ui.updates.map((u) => <div key={u.toolUseId}>{ui.render(u)}</div>)}</div>
+      <Composer onSend={session.send} />
+    </>
+  );
+}
+```
+
+Renderer functions receive the validated props plus a `meta` object with the raw update:
+
+```tsx
+weather_card: (props, { complete, partial }) => (
+  <WeatherCard {...(props as WeatherProps)} loading={!complete} />
+),
+```
+
+### Streaming partial updates
+
+While the model is still emitting the tool input, `useGenerativeUI` surfaces incremental updates with `partial: true`. The L1 partial-JSON parser is conservative — it only emits a key once its value is fully delimited — so you'll never see `7` flicker into `72` mid-render.
+
+If you want skeleton states, render against `props` directly: as fields land they become defined; before that, your renderer just won't have those keys yet.
+
+### Without a server schema
+
+If you don't want to run `loadSchema()`, pass `serverName` / `prefix` directly. The hook will then dispatch any `tool_use` whose name matches `mcp__<serverName>__<prefix><short_name>`:
+
+```tsx
+useGenerativeUI({
+  serverName: "genui",
+  prefix: "render_",
+  renderers: { weather_card: ... },
+});
+```
+
+Type-checking is up to you in this mode — the schema is what carries it.
+
+## Lower-level building blocks
+
+If you're not on React, `@agent-webkit/core/genui` gives you the same machinery without any framework dependency:
+
+```ts
+import { GenUIStream } from "@agent-webkit/core/genui";
+
+const ui = new GenUIStream({ schemaUrl: "/genui/schema" });
+await ui.loadSchema();
+
+for await (const ev of session.events()) {
+  const update = ui.feed(ev);
+  if (update) {
+    // dispatch to your own renderer / template engine / Svelte store / ...
+  }
+}
+```
+
+`GenUIStream.feed()` returns `null` for any event it doesn't care about, so it's safe to pipe every wire event through it.
+
+## Caveats
+
+- The render tools are deliberately stub handlers — they return `"rendered:<name>"` server-side. The actual UI work is client-side. **Don't put logic in those handlers** assuming it will run for every render; the agent may invoke them, the client may receive the event, but the server-side handler is just there to satisfy the SDK.
+- Auto-allowing render tools means there's no permission prompt. That's deliberate — they have no side effects — but if you also register a registry with side-effecting tools, **don't reuse the same `GenUIRegistry`** for them. Use the regular `can_use_tool` path for anything that mutates state.
+- The schema endpoint is unauthenticated by design. It carries no session data; only your component contracts. If those contracts are themselves sensitive (e.g. proprietary product names), gate the route at your reverse proxy.
