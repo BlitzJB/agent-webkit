@@ -6,7 +6,7 @@
 import { describe, it, expect } from "vitest";
 import { renderHook, act, waitFor } from "@testing-library/react";
 import type { DeliveredEvent } from "@agent-webkit/core";
-import type { GenUISchemaPayload } from "@agent-webkit/core/genui";
+import type { GenUISchemaPayload, GenUIUpdate } from "@agent-webkit/core/genui";
 import { useGenerativeUI } from "../src/useGenerativeUI.js";
 
 const SCHEMA: GenUISchemaPayload = {
@@ -169,6 +169,75 @@ describe("useGenerativeUI", () => {
       result.current.onEvent(toolUseEvent("mcp__genui__render_weather_card", { x: 1 }));
     });
     expect(result.current.updates).toHaveLength(1);
+  });
+
+  it("propagates byte-by-byte fragmented stream without tearing or losing data", () => {
+    // Capture every observable state of `updates` after each byte.
+    const observed: GenUIUpdate[][] = [];
+    const { result } = renderHook(() =>
+      useGenerativeUI({
+        schema: SCHEMA,
+        renderers: {
+          weather_card: (props) => JSON.stringify(props),
+        },
+      }),
+    );
+
+    const fullJson = '{"location":"Boston, MA","temperature_f":72,"condition":"sunny"}';
+    // Drip one character at a time, taking a snapshot after each drip in its
+    // own act() so React commits between bytes — this is the worst-case
+    // delivery pattern the partial-JSON parser must survive.
+    for (let i = 0; i < fullJson.length; i++) {
+      act(() => {
+        result.current.onEvent(
+          deltaEvent(fullJson[i]!, "tu-frag", "m-1", i + 1, "mcp__genui__render_weather_card"),
+        );
+      });
+      observed.push(result.current.updates);
+    }
+
+    // Always exactly one update entry — the partial parser must merge every
+    // delta into the same tool_use_id, never duplicate it.
+    for (const snap of observed) {
+      expect(snap).toHaveLength(1);
+      expect(snap[0]!.toolUseId).toBe("tu-frag");
+      expect(snap[0]!.shortName).toBe("weather_card");
+    }
+
+    // Final byte yields fully parsed props.
+    const last = observed[observed.length - 1]![0]!;
+    expect(last.props).toEqual({
+      location: "Boston, MA",
+      temperature_f: 72,
+      condition: "sunny",
+    });
+
+    // Monotonic recovery: once `location` appears as a string, it must only
+    // grow (or hold steady) until reaching its final value. No rewind.
+    let lastLocation = "";
+    for (const snap of observed) {
+      const loc = (snap[0]!.props as { location?: string }).location;
+      if (typeof loc === "string") {
+        expect(loc.startsWith(lastLocation) || lastLocation.startsWith(loc)).toBe(true);
+        if (loc.length >= lastLocation.length) lastLocation = loc;
+      }
+    }
+    expect(lastLocation).toBe("Boston, MA");
+
+    // Finalizing tool_use does not duplicate the entry.
+    act(() => {
+      result.current.onEvent(
+        toolUseEvent(
+          "mcp__genui__render_weather_card",
+          { location: "Boston, MA", temperature_f: 72, condition: "sunny" },
+          "tu-frag",
+          "m-1",
+          999,
+        ),
+      );
+    });
+    expect(result.current.updates).toHaveLength(1);
+    expect(result.current.updates[0]!.complete).toBe(true);
   });
 
   it("reset() clears updates", () => {
