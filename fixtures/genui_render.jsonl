@@ -1,0 +1,6 @@
+{"kind": "expect_user_query"}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_1", "content": [{"type": "tool_use", "id": "tu_1", "name": "mcp__genui__render_weather_card", "input": {"location": "Boston, MA", "temperature_f": 72, "condition": "sunny"}}], "model": "claude-opus-4-7"}}
+{"kind": "callback_expect", "tool_name": "mcp__genui__render_weather_card", "tool_input": {"location": "Boston, MA", "temperature_f": 72, "condition": "sunny"}, "context": {"tool_use_id": "tu_1"}, "respond": {"behavior": "allow"}}
+{"kind": "outbound", "message": {"type": "UserMessage", "content": [{"type": "tool_result", "tool_use_id": "tu_1", "content": "rendered:weather_card", "is_error": false}]}}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_2", "content": [{"type": "text", "text": "Done."}], "model": "claude-opus-4-7", "stop_reason": "end_turn"}}
+{"kind": "outbound", "message": {"type": "ResultMessage", "session_id": "fake-genui", "subtype": "success"}}

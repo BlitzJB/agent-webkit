@@ -26,18 +26,30 @@ from ..session import BackpressureError, SessionConfig, SessionRegistry
 logger = logging.getLogger(__name__)
 
 
-def _make_real_sdk_factory(session_store: Any = None):  # pragma: no cover - requires real claude_agent_sdk; covered indirectly by integration tests
-    """Build the default factory, optionally pre-wired with a SessionStore.
+def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk; covered indirectly by integration tests
+    session_store: Any = None,
+    genui: Any = None,
+):
+    """Build the default factory, optionally pre-wired with a SessionStore and/or GenUI.
 
     The callback is plumbed in via ClaudeAgentOptions(can_use_tool=...) — the SDK's
     documented contract — so no post-construction mutation is required. If a
     ``session_store`` is supplied it is forwarded to ``ClaudeAgentOptions`` so the
-    SDK persists conversation state through it.
+    SDK persists conversation state through it. If a ``genui`` registry is supplied,
+    the factory mounts an in-process MCP server exposing one tool per registered
+    component, auto-allows those tool calls through ``can_use_tool``, and merges a
+    system-prompt addendum that nudges the model to use them.
     """
     async def factory(config: SessionConfig, can_use_tool: Any) -> SDKClient:
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # type: ignore
 
-        options_kwargs: dict[str, Any] = {"can_use_tool": can_use_tool}
+        local_can_use_tool = can_use_tool
+        if genui is not None:
+            from ..extras.genui import wrap_can_use_tool_for_genui
+
+            local_can_use_tool = wrap_can_use_tool_for_genui(can_use_tool, genui)
+
+        options_kwargs: dict[str, Any] = {"can_use_tool": local_can_use_tool}
         if config.model:
             options_kwargs["model"] = config.model
         if config.permission_mode:
@@ -47,6 +59,18 @@ def _make_real_sdk_factory(session_store: Any = None):  # pragma: no cover - req
         if session_store is not None:
             options_kwargs["session_store"] = session_store
 
+        if genui is not None:
+            mcp_server = genui.build_mcp_server()
+            options_kwargs["mcp_servers"] = {genui.server_name: mcp_server}
+            options_kwargs["allowed_tools"] = genui.allowed_tool_patterns()
+            addendum = genui.system_prompt_addendum()
+            if addendum:
+                options_kwargs["system_prompt"] = {
+                    "type": "preset",
+                    "preset": "claude_code",
+                    "append": addendum,
+                }
+
         options = ClaudeAgentOptions(**options_kwargs)
         client = ClaudeSDKClient(options=options)
         await client.connect()
@@ -55,7 +79,7 @@ def _make_real_sdk_factory(session_store: Any = None):  # pragma: no cover - req
     return factory
 
 
-# Backwards-compatible default factory (no session_store).
+# Backwards-compatible default factory (no session_store, no genui).
 _real_sdk_factory = _make_real_sdk_factory()
 
 
@@ -64,6 +88,7 @@ def create_app(
     auth: Optional[AuthConfig] = None,
     sdk_factory=None,
     session_store: Any = None,
+    genui: Any = None,
 ) -> FastAPI:
     """Build a FastAPI app exposing the agent-webkit wire protocol.
 
@@ -71,15 +96,21 @@ def create_app(
         auth: Bearer-token auth policy. Defaults to ``AuthConfig.from_env()``.
         sdk_factory: Optional callable building each session's ``ClaudeSDKClient``.
             Override to inject custom ``ClaudeAgentOptions`` (system prompt, MCP servers,
-            hooks, etc.). When supplied, ``session_store`` is ignored — the caller is
-            responsible for wiring it into their own factory.
+            hooks, etc.). When supplied, ``session_store`` and ``genui`` are still wired
+            up at the HTTP layer (``GET /genui/schema`` is still mounted) but the caller
+            is responsible for wiring them into their own ``ClaudeAgentOptions``.
         session_store: Optional ``SessionStore`` instance forwarded to
             ``ClaudeAgentOptions(session_store=...)`` by the default factory. Use this
             with the bundled :class:`PgSessionStore` for failover-friendly setups.
+        genui: Optional :class:`agent_webkit_server.extras.genui.GenUIRegistry` instance.
+            When provided, ``GET /genui/schema`` is mounted (publicly readable — the
+            schema is a public client-side contract, not session state), and the default
+            factory mounts the registry's MCP server, auto-allows its tools through
+            ``can_use_tool``, and appends a system-prompt nudge.
     """
     auth = auth or AuthConfig.from_env()
     if sdk_factory is None:
-        sdk_factory = _make_real_sdk_factory(session_store=session_store)
+        sdk_factory = _make_real_sdk_factory(session_store=session_store, genui=genui)
     registry = SessionRegistry(sdk_factory)
 
     @contextlib.asynccontextmanager
@@ -93,6 +124,11 @@ def create_app(
     app = FastAPI(title="agent-webkit reference server", version="0.1.0", lifespan=lifespan)
 
     auth_dep = require_auth(auth)
+
+    if genui is not None:
+        @app.get("/genui/schema")
+        async def genui_schema() -> JSONResponse:
+            return JSONResponse(genui.schema_payload())
 
     @app.post("/sessions", response_model=CreateSessionResponse, dependencies=[Depends(auth_dep)])
     async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:

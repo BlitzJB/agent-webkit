@@ -4,6 +4,7 @@ import {
   type AgentClient,
   type ApproveOptions,
   type CreateSessionOptions,
+  type DeliveredEvent,
   type DenyOptions,
   type Session,
   type UserInput,
@@ -28,6 +29,12 @@ export interface UseAgentSessionOptions {
   client?: AgentClient;
   /** Auto-start the session on mount. Defaults to true. */
   autoStart?: boolean;
+  /**
+   * Optional event tap. Called with every wire event before reducer dispatch.
+   * Used by L2 hooks (e.g. useGenerativeUI) to consume the raw event stream
+   * without forking the connection.
+   */
+  onEvent?: (event: DeliveredEvent) => void;
 }
 
 export interface UseAgentSessionReturn extends AgentState {
@@ -60,6 +67,8 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
   const { baseUrl, token, sessionId: attachSessionId, resumeFromEventId, autoStart = true } = opts;
   const createOpts = opts.create;
   const injectedClient = opts.client;
+  const onEventRef = useRef(opts.onEvent);
+  onEventRef.current = opts.onEvent;
 
   useEffect(() => {
     if (!autoStart) return;
@@ -91,6 +100,14 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
       try {
         for await (const ev of session.events()) {
           if (aborted) break;
+          const tap = onEventRef.current;
+          if (tap) {
+            try {
+              tap(ev);
+            } catch {
+              /* taps must not break the reducer pipeline */
+            }
+          }
           dispatch({ type: "server_event", event: ev });
         }
       } catch (err) {

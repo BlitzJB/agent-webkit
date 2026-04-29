@@ -6,6 +6,7 @@
     "backend-fastapi",
     "backend-custom-adapter",
     "permissions",
+    "generative-ui",
     "resume-and-reconnect",
     "postgres-sessions",
     "deployment"

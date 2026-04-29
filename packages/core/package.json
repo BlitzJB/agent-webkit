@@ -28,6 +28,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./genui": {
+      "types": "./dist/genui/index.d.ts",
+      "import": "./dist/genui/index.js"
     }
   },
   "files": [
