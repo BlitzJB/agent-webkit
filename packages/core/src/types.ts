@@ -84,6 +84,43 @@ export type ServerEvent =
     }
   | { event: "error"; data: { code: string; message: string } }
   | { event: "mcp_status_change"; data: { server_name: string; status: string } }
+  | {
+      event: "artefact_created";
+      data: {
+        artefact_id: string;
+        title: string;
+        kind: ArtefactKind;
+        language?: string | null;
+        version: number;
+        content: string;
+        summary?: string | null;
+        session_id: string;
+        created_at: number;
+      };
+    }
+  | {
+      event: "artefact_updated";
+      data: {
+        artefact_id: string;
+        version: number;
+        content: string;
+        summary?: string | null;
+        updated_at: number;
+      };
+    }
+  | { event: "artefact_deleted"; data: { artefact_id: string } }
+  | {
+      // Synthetic event emitted by the server when a `Last-Event-ID` falls off the
+      // ring buffer in `?graceful=1` mode. Clients should rehydrate state from the
+      // REST snapshot endpoints and resume tailing — their next `Last-Event-ID`
+      // is this event's `seq` (== `oldest_available_id - 1`).
+      event: "replay_truncated";
+      data: {
+        requested_event_id: number;
+        oldest_available_id: number;
+        last_event_id: number;
+      };
+    }
   | { event: "done"; data: Record<string, never> };
 
 export type ServerEventName = ServerEvent["event"];
@@ -128,4 +165,48 @@ export interface CreateSessionOptions {
 export interface CreateSessionResponse {
   session_id: string;
   protocol_version: string;
+}
+
+// --- Artefacts (REST snapshot + wire events) ---
+
+export type ArtefactKind =
+  | "text/markdown"
+  | "text/plain"
+  | "application/json"
+  | "text/code";
+
+export interface ArtefactSummary {
+  artefact_id: string;
+  session_id: string;
+  title: string;
+  kind: ArtefactKind;
+  language?: string | null;
+  current_version: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ArtefactRead extends ArtefactSummary {
+  version: number;
+  content: string;
+  summary?: string | null;
+}
+
+export interface ArtefactVersion {
+  artefact_id: string;
+  version: number;
+  content: string;
+  summary?: string | null;
+  created_at: number;
+  created_by: "agent" | "user";
+}
+
+// Aggregated rehydration payload — what a client fetches after a
+// `replay_truncated` event (or on cold-start from a known session id).
+export interface SessionSnapshot {
+  session_id: string;
+  protocol_version: string;
+  last_event_id: number;
+  messages: AssistantMessage[] | Record<string, unknown>[];
+  artefacts: ArtefactSummary[];
 }

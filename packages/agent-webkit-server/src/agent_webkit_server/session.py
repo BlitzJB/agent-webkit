@@ -34,10 +34,15 @@ class SessionConfig:
         model: Optional[str] = None,
         permission_mode: Optional[str] = None,
         cwd: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> None:
         self.model = model
         self.permission_mode = permission_mode
         self.cwd = cwd
+        # Pre-allocated by SessionRegistry.create() before the SDK factory is
+        # invoked so factory implementations that mount per-session MCP servers
+        # (e.g. the artefact tools) can scope their handlers to this id.
+        self.session_id = session_id
 
 
 class Session:
@@ -80,6 +85,14 @@ class Session:
             "protocol_version": PROTOCOL_VERSION,
         })
 
+        # Per-session reduced message buffer. Append-only list of completed
+        # assistant/user messages, kept in arrival order. Used by
+        # ``GET /sessions/{id}/messages`` (and ``/snapshot``) to rehydrate
+        # state for clients that fell off the SSE ring buffer. The buffer
+        # mirrors what the L2 reducer would produce; we maintain it server-side
+        # because the ring buffer is bounded but a chat history should not be.
+        self.messages: list[dict[str, Any]] = []
+
         # Start the receive-side translator pulling from the SDK.
         self._tasks.append(asyncio.create_task(
             self._run_receive_loop(), name=f"session-{self.id}-recv"
@@ -91,6 +104,15 @@ class Session:
     async def _run_receive_loop(self) -> None:
         def emit(event: str, data: dict[str, Any]) -> None:
             self.event_log.append(event, data)
+            # Mirror completed messages into the durable per-session buffer so
+            # cold-start clients can rehydrate via /messages or /snapshot. We
+            # only record `message_complete` (not deltas / tool_use / tool_result)
+            # — the reducer the client would run against the ring lands on the
+            # same set of "stable" messages, and we keep the buffer modest.
+            if event == "message_complete":
+                msg = data.get("message")
+                if isinstance(msg, dict):
+                    self.messages.append(msg)
             # `result` marks the end of a turn — release the send loop to dispatch the
             # next queued query. Per the spec: receive_messages() must finish draining
             # before accepting the next query().
@@ -145,6 +167,12 @@ class Session:
     async def submit_user_message(self, content: Any) -> None:
         # SDK expects: {"type": "user", "message": {"role": "user", "content": ...}}
         wrapped = {"type": "user", "message": {"role": "user", "content": content}}
+        # Mirror into the rehydration buffer. Assistant messages land via the
+        # receive loop's `message_complete` handler; user messages have no such
+        # event in the wire (the SDK echoes tool_result blocks in UserMessage,
+        # which we already emit as `tool_result` events), so we synthesise
+        # a user-shaped entry here. Mirrors what an L2 reducer would produce.
+        self.messages.append({"role": "user", "content": content})
         try:
             self._inbound.put_nowait(wrapped)
         except asyncio.QueueFull:
@@ -246,7 +274,12 @@ class SessionRegistry:
         event_log = EventLog()
         router = PermissionRouter()
         can_use_tool = build_can_use_tool(event_log.append, router)
-        client = await self._invoke_factory(config, can_use_tool)
+        # Pre-fill the session_id on the config so factories that mount per-session
+        # MCP servers (e.g. artefact tools) can scope their handlers to it.
+        config.session_id = session_id
+        client = await self._invoke_factory(
+            config, can_use_tool, event_log_append=event_log.append
+        )
         session = Session(
             session_id,
             client,
@@ -258,13 +291,56 @@ class SessionRegistry:
         self._sessions[session_id] = session
         return session
 
-    async def _invoke_factory(self, config: SessionConfig, can_use_tool: Any) -> SDKClient:
-        """Call factory with both arguments; tolerate legacy single-arg factories."""
-        try:
+    async def _invoke_factory(
+        self,
+        config: SessionConfig,
+        can_use_tool: Any,
+        *,
+        event_log_append: Any = None,
+    ) -> SDKClient:
+        """Call the factory with the richest signature it accepts.
+
+        The contract has grown over time:
+        * v1.0: ``(config)``
+        * v1.1: ``(config, can_use_tool)`` — added when permissions came online.
+        * v1.2: ``(config, can_use_tool, *, event_log_append=...)`` — added so
+          per-session MCP servers (artefacts) can publish wire events directly.
+
+        We use ``inspect.signature`` to pick the right shape rather than the
+        old ``try/except TypeError`` chain, which couldn't distinguish a
+        signature mismatch from a TypeError raised *inside* the factory body
+        (which would be silently swallowed by the fallback).
+        """
+        import inspect
+
+        sig = inspect.signature(self._sdk_factory)
+        params = sig.parameters
+
+        # Detect whether the factory accepts the v1.2 kwarg or **kwargs.
+        accepts_event_log = (
+            "event_log_append" in params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        )
+        # Count positional-or-keyword (and positional-only) params, excluding *args
+        # and var-keyword. This tells us whether the factory wants 1 or 2 positionals.
+        positional_kinds = (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        positional_params = [p for p in params.values() if p.kind in positional_kinds]
+        accepts_var_pos = any(
+            p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values()
+        )
+        n_positional = len(positional_params)
+
+        if accepts_var_pos or n_positional >= 2:
+            if accepts_event_log:
+                return await self._sdk_factory(
+                    config, can_use_tool, event_log_append=event_log_append
+                )
             return await self._sdk_factory(config, can_use_tool)
-        except TypeError:
-            # Backward compatibility for factories written before the callback contract.
-            return await self._sdk_factory(config)
+        # v1.0 single-arg factory.
+        return await self._sdk_factory(config)
 
     def get(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)

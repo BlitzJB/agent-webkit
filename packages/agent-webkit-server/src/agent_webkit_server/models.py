@@ -174,6 +174,42 @@ class McpStatusChangeData(BaseModel):
     status: str
 
 
+class ArtefactCreatedData(BaseModel):
+    artefact_id: str
+    title: str
+    kind: str
+    language: Optional[str] = None
+    version: int
+    content: str
+    summary: Optional[str] = None
+    session_id: str
+    created_at: int
+
+
+class ArtefactUpdatedData(BaseModel):
+    artefact_id: str
+    version: int
+    content: str
+    summary: Optional[str] = None
+    updated_at: int
+
+
+class ArtefactDeletedData(BaseModel):
+    artefact_id: str
+
+
+class ReplayTruncatedData(BaseModel):
+    """Synthetic event emitted when a subscriber's ``Last-Event-ID`` falls
+    off the ring buffer in ``?graceful=1`` mode. The client should rehydrate
+    state from the REST snapshot endpoints, then continue tailing — its next
+    ``Last-Event-ID`` will be this event's ``seq`` (``oldest_available_id - 1``)
+    which lands on the first event still in the ring."""
+
+    requested_event_id: int
+    oldest_available_id: int
+    last_event_id: int
+
+
 # Names of all valid outbound events. Used for contract validation.
 OUTBOUND_EVENT_NAMES: frozenset[str] = frozenset({
     "session_ready",
@@ -188,4 +224,62 @@ OUTBOUND_EVENT_NAMES: frozenset[str] = frozenset({
     "error",
     "mcp_status_change",
     "done",
+    "artefact_created",
+    "artefact_updated",
+    "artefact_deleted",
+    "replay_truncated",
 })
+
+
+# --- REST endpoint response models (artefacts) ---
+
+class ArtefactSummaryResponse(BaseModel):
+    artefact_id: str
+    session_id: str
+    title: str
+    kind: str
+    language: Optional[str] = None
+    current_version: int
+    created_at: int
+    updated_at: int
+
+
+class ArtefactReadResponse(BaseModel):
+    artefact_id: str
+    session_id: str
+    title: str
+    kind: str
+    language: Optional[str] = None
+    current_version: int
+    version: int
+    content: str
+    summary: Optional[str] = None
+    created_at: int
+    updated_at: int
+
+
+class ArtefactVersionResponse(BaseModel):
+    artefact_id: str
+    version: int
+    content: str
+    summary: Optional[str] = None
+    created_at: int
+    created_by: str
+
+
+class SnapshotResponse(BaseModel):
+    """Aggregated rehydration payload — what a client fetches after a
+    ``replay_truncated`` event (or on cold-start from a known session id).
+
+    ``last_event_id`` is the wire seq the client should continue tailing from
+    via ``Last-Event-ID``. ``messages`` and ``artefacts`` are session state
+    that has been reconstituted from durable stores (SDK SessionStore + the
+    per-session reduced message buffer in :class:`Session`, and the bound
+    :class:`ArtefactStore` respectively).
+    """
+
+    session_id: str
+    protocol_version: str = "1.0"
+    last_event_id: int
+    messages: list[dict[str, Any]] = Field(default_factory=list)
+    artefacts: list[ArtefactSummaryResponse] = Field(default_factory=list)
