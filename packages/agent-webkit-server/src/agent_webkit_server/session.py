@@ -35,6 +35,7 @@ class SessionConfig:
         permission_mode: Optional[str] = None,
         cwd: Optional[str] = None,
         session_id: Optional[str] = None,
+        resume: Optional[str] = None,
     ) -> None:
         self.model = model
         self.permission_mode = permission_mode
@@ -43,6 +44,11 @@ class SessionConfig:
         # invoked so factory implementations that mount per-session MCP servers
         # (e.g. the artefact tools) can scope their handlers to this id.
         self.session_id = session_id
+        # When set, the factory should plumb this through to
+        # ``ClaudeAgentOptions(resume=...)`` so the SDK rehydrates the
+        # transcript from its bound SessionStore instead of starting fresh.
+        # Used by :meth:`SessionRegistry.get_or_load` for cold-start.
+        self.resume = resume
 
 
 class Session:
@@ -248,11 +254,34 @@ class Session:
 
 
 class SessionRegistry:
-    def __init__(self, sdk_factory: SDKFactory, *, idle_timeout_s: float = 300.0) -> None:
+    def __init__(
+        self,
+        sdk_factory: SDKFactory,
+        *,
+        idle_timeout_s: float = 300.0,
+        session_store: Any = None,
+        project_key: str = "default",
+    ) -> None:
         self._sdk_factory = sdk_factory
         self._sessions: dict[str, Session] = {}
         self._idle_timeout_s = idle_timeout_s
+        # Optional read-through for cold-start. When set, :meth:`get_or_load`
+        # consults the store for an unknown session_id and re-instantiates
+        # the :class:`Session` with the SDK's ``resume=`` plumbed through.
+        self._session_store = session_store
+        self._project_key = project_key
+        # Per-id locks to keep concurrent get_or_load() calls for the same
+        # cold session_id from racing two SDK clients into existence.
+        self._load_locks: dict[str, asyncio.Lock] = {}
         self._reaper_task: Optional[asyncio.Task[None]] = None
+
+    @property
+    def session_store(self) -> Any:
+        return self._session_store
+
+    @property
+    def project_key(self) -> str:
+        return self._project_key
 
     def start_reaper(self) -> None:  # pragma: no cover - lifespan-managed background task
         if self._reaper_task is None or self._reaper_task.done():
@@ -344,6 +373,75 @@ class SessionRegistry:
 
     def get(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)
+
+    async def get_or_load(self, session_id: str) -> Optional[Session]:
+        """Return the in-memory :class:`Session` for ``session_id``, or — if
+        a ``session_store`` is bound and the store has a transcript for this
+        id — instantiate one with ``resume=session_id`` plumbed to the SDK.
+
+        Returns ``None`` only when neither the registry nor the store knows
+        about the id. Concurrent calls for the same id are serialised so we
+        don't race two SDK clients into existence; once one wins, subsequent
+        calls return the same instance from ``self._sessions``.
+
+        Side effect: a hit on the store path adds the rehydrated session to
+        the registry, so future ``get()`` calls bypass the load. The reaper
+        will evict it on idle the same as any other session.
+        """
+        existing = self._sessions.get(session_id)
+        if existing is not None:
+            return existing
+        if self._session_store is None:
+            return None
+
+        # Per-id lock so a flurry of concurrent /messages, /artefacts, /stream
+        # requests for the same cold session don't each spin up an SDK client.
+        lock = self._load_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._load_locks[session_id] = lock
+
+        async with lock:
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                return existing
+            try:
+                entries = await self._session_store.load(
+                    {
+                        "project_key": self._project_key,
+                        "session_id": session_id,
+                        "subpath": "",
+                    }
+                )
+            except Exception:
+                logger.exception("session_store.load failed for %s", session_id)
+                return None
+            if not entries:
+                return None
+            # Build a resume-config for the factory. We don't know the original
+            # model / cwd / permission_mode — those live in the SDK's transcript
+            # and are restored by ``resume=`` itself, so we leave them None.
+            config = SessionConfig(session_id=session_id, resume=session_id)
+            event_log = EventLog()
+            router = PermissionRouter()
+            can_use_tool = build_can_use_tool(event_log.append, router)
+            try:
+                client = await self._invoke_factory(
+                    config, can_use_tool, event_log_append=event_log.append
+                )
+            except Exception:
+                logger.exception("Factory failed during cold-start for %s", session_id)
+                return None
+            session = Session(
+                session_id,
+                client,
+                event_log=event_log,
+                router=router,
+                idle_timeout_s=self._idle_timeout_s,
+            )
+            await session.start()
+            self._sessions[session_id] = session
+            return session
 
     async def remove(self, session_id: str) -> None:
         s = self._sessions.pop(session_id, None)

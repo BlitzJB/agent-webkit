@@ -76,19 +76,29 @@ def app_with_artefacts(no_auth: AuthConfig):
     return app, store
 
 
-class TestRESTEndpointsRequireSession:
-    def test_list_artefacts_404_for_unknown_session(
+class TestRESTEndpointsColdStart:
+    """The artefact and snapshot endpoints are cold-start safe: they read
+    straight from the persistent stores and don't require an in-memory
+    Session. An unknown session id returns an empty list rather than 404 —
+    artefact_store is the source of truth, not the live registry."""
+
+    def test_list_artefacts_for_unknown_session_returns_empty_not_404(
         self, app_with_artefacts
     ) -> None:
         app, _ = app_with_artefacts
         with TestClient(app) as client:
             res = client.get("/sessions/nope/artefacts")
-        assert res.status_code == 404
+        assert res.status_code == 200
+        assert res.json() == []
 
-    def test_snapshot_404_for_unknown_session(self, app_with_artefacts) -> None:
+    def test_snapshot_404_for_session_with_no_persistent_state(
+        self, app_with_artefacts
+    ) -> None:
+        # /snapshot still 404s when nothing on the system knows about the id
+        # — registry, session_store, and artefact_store all empty for this id.
         app, _ = app_with_artefacts
         with TestClient(app) as client:
-            res = client.get("/sessions/nope/snapshot")
+            res = client.get("/sessions/never-existed/snapshot")
         assert res.status_code == 404
 
 
@@ -235,6 +245,161 @@ class TestEndpointsNotMountedWithoutStore:
             res = client.get(f"/sessions/{sid}/snapshot")
             assert res.status_code == 200
             assert res.json()["artefacts"] == []
+
+
+class _FakeSessionStore:
+    """Minimal SessionStore stub for cold-start tests.
+
+    Stores a list of SDK transcript entries per (project_key, session_id)
+    and serves load(). project_key defaults to ``default`` to match
+    create_app's default."""
+
+    def __init__(self) -> None:
+        self.data: dict[tuple[str, str, str], list[dict]] = {}
+
+    def put(
+        self,
+        session_id: str,
+        entries: list[dict],
+        *,
+        project_key: str = "default",
+        subpath: str = "",
+    ) -> None:
+        self.data[(project_key, session_id, subpath)] = list(entries)
+
+    async def load(self, key: dict):
+        return self.data.get(
+            (key["project_key"], key["session_id"], key.get("subpath") or "")
+        )
+
+    async def append(self, key: dict, entries: list[dict]) -> None:
+        bucket = self.data.setdefault(
+            (key["project_key"], key["session_id"], key.get("subpath") or ""),
+            [],
+        )
+        bucket.extend(entries)
+
+
+class TestColdStartReadThrough:
+    def test_messages_endpoint_reads_from_session_store_when_no_live_session(
+        self, no_auth: AuthConfig
+    ) -> None:
+        store = _FakeSessionStore()
+        store.put(
+            "cold-sid",
+            [
+                {"type": "user", "message": {"role": "user", "content": "hi"}},
+                {
+                    "type": "assistant",
+                    "message": {
+                        "id": "m1",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "hello"}],
+                    },
+                },
+                {"type": "title", "value": "ignored"},
+            ],
+        )
+        app = create_app(
+            auth=no_auth,
+            sdk_factory=_fake_factory,
+            session_store=store,
+        )
+        with TestClient(app) as client:
+            res = client.get("/sessions/cold-sid/messages")
+        assert res.status_code == 200
+        body = res.json()
+        # User row projected, assistant row passes through, title dropped.
+        assert body["messages"] == [
+            {"role": "user", "content": "hi"},
+            {
+                "id": "m1",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "hello"}],
+            },
+        ]
+        assert body["session_id"] == "cold-sid"
+
+    def test_snapshot_finds_known_session_via_session_store(
+        self, no_auth: AuthConfig
+    ) -> None:
+        store = _FakeSessionStore()
+        store.put(
+            "cold-sid",
+            [{"type": "user", "message": {"role": "user", "content": "x"}}],
+        )
+        app = create_app(
+            auth=no_auth,
+            sdk_factory=_fake_factory,
+            session_store=store,
+        )
+        with TestClient(app) as client:
+            res = client.get("/sessions/cold-sid/snapshot")
+        assert res.status_code == 200
+        body = res.json()
+        assert body["session_id"] == "cold-sid"
+        assert body["messages"] == [{"role": "user", "content": "x"}]
+
+    def test_snapshot_finds_known_session_via_artefact_store_alone(
+        self, no_auth: AuthConfig
+    ) -> None:
+        # No session_store, only artefact_store with rows for this id.
+        astore = InMemoryArtefactStore()
+        asyncio.run(
+            astore.create(
+                session_id="cold-sid",
+                title="P",
+                kind="text/markdown",
+                content="hi",
+            )
+        )
+        app = create_app(
+            auth=no_auth,
+            sdk_factory=_fake_factory,
+            artefact_store=astore,
+        )
+        with TestClient(app) as client:
+            res = client.get("/sessions/cold-sid/snapshot")
+        assert res.status_code == 200
+        body = res.json()
+        # No messages (no session_store, no live session) but artefact present.
+        assert body["messages"] == []
+        assert [a["title"] for a in body["artefacts"]] == ["P"]
+
+
+class TestColdStartSessionRehydration:
+    def test_get_or_load_reinstantiates_session_when_store_has_it(
+        self, no_auth: AuthConfig
+    ) -> None:
+        store = _FakeSessionStore()
+        store.put(
+            "ghost-sid",
+            [{"type": "user", "message": {"role": "user", "content": "ping"}}],
+        )
+        captured_resume: list[str | None] = []
+
+        async def factory(config, can_use_tool, *, event_log_append=None):
+            captured_resume.append(config.resume)
+            return _FakeSDKClient()
+
+        app = create_app(
+            auth=no_auth,
+            sdk_factory=factory,
+            session_store=store,
+        )
+        with TestClient(app) as client:
+            # Streaming a never-created-this-process session must not 404 if
+            # the store has the transcript — registry.get_or_load resumes it.
+            res = client.get(
+                "/sessions/ghost-sid/stream",
+                headers={"accept": "text/event-stream"},
+                timeout=0.5,
+            )
+            # SSE responses 200 even when nothing arrives within the test
+            # window — we mainly care that the registry didn't 404 and that
+            # the factory was called with resume=ghost-sid.
+            assert res.status_code == 200
+        assert captured_resume == ["ghost-sid"]
 
 
 class TestMessagesEndpoint:

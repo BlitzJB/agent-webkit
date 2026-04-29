@@ -106,6 +106,10 @@ def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk
             options_kwargs["permission_mode"] = config.permission_mode
         if config.cwd:
             options_kwargs["cwd"] = config.cwd
+        if config.resume:
+            # Cold-start path: the SDK reads the transcript from its bound
+            # SessionStore instead of starting a fresh conversation.
+            options_kwargs["resume"] = config.resume
         if session_store is not None:
             options_kwargs["session_store"] = session_store
         if mcp_servers:
@@ -138,6 +142,7 @@ def create_app(
     session_store: Any = None,
     genui: Any = None,
     artefact_store: Any = None,
+    project_key: str = "default",
 ) -> FastAPI:
     """Build a FastAPI app exposing the agent-webkit wire protocol.
 
@@ -166,7 +171,11 @@ def create_app(
             genui=genui,
             artefact_store=artefact_store,
         )
-    registry = SessionRegistry(sdk_factory)
+    registry = SessionRegistry(
+        sdk_factory,
+        session_store=session_store,
+        project_key=project_key,
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -191,6 +200,7 @@ def create_app(
             model=req.model,
             permission_mode=req.permission_mode,
             cwd=req.cwd,
+            resume=req.resume,
         )
         s = await registry.create(config)
         return CreateSessionResponse(session_id=s.id, protocol_version=PROTOCOL_VERSION)
@@ -206,7 +216,9 @@ def create_app(
         request: Request,
         graceful: int = 0,
     ) -> StreamingResponse:
-        s = registry.get(session_id)
+        # Cold-start: if the registry doesn't have the session but a
+        # session_store does, re-instantiate before opening the stream.
+        s = await registry.get_or_load(session_id)
         if s is None:
             raise HTTPException(status_code=404, detail="Session not found")
         last_event_id = request.headers.get("last-event-id")
@@ -326,24 +338,86 @@ def create_app(
     # `replay_truncated` synthetic event (in `?graceful=1` mode); it then hits
     # these endpoints to rebuild state and resumes tailing from the synthetic
     # event's seq.
+    #
+    # Cold-start contract: every read endpoint here works without an in-memory
+    # :class:`Session`. The artefact endpoints serve straight from the durable
+    # ``artefact_store``; ``/messages`` and ``/snapshot`` fall back to a
+    # read-through translator over ``session_store.load(...)`` so a freshly
+    # restarted server still rehydrates a known session_id.
 
-    def _ensure_session(session_id: str):
+    async def _resolve_messages(
+        session_id: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Returns ``(messages, last_event_id)`` for the rehydration endpoints.
+
+        Preference order:
+        1. Live in-memory buffer (cheap, exact).
+        2. Read-through from ``session_store`` (cold-start; translates SDK
+           transcript entries into the wire-friendly buffer shape).
+        3. Empty list when neither is available.
+        """
         s = registry.get(session_id)
-        if s is None:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return s
+        if s is not None and s.messages:
+            return list(s.messages), s.event_log.last_seq
+        if session_store is not None:
+            try:
+                from ..extras.messages import load_messages_for_session
+
+                msgs = await load_messages_for_session(
+                    session_store=session_store,
+                    project_key=project_key,
+                    session_id=session_id,
+                )
+                last_seq = s.event_log.last_seq if s is not None else 0
+                return msgs, last_seq
+            except Exception:
+                logger.exception("session_store read-through failed")
+        if s is not None:
+            return list(s.messages), s.event_log.last_seq
+        return [], 0
+
+    async def _session_known(session_id: str) -> bool:
+        """Cold-start aware existence check.
+
+        A session is "known" if the registry holds it, the session_store has
+        a transcript for it, OR the artefact_store has any artefact bound to
+        it. Any of those is enough to justify serving REST data without a
+        live :class:`Session`.
+        """
+        if registry.get(session_id) is not None:
+            return True
+        if session_store is not None:
+            try:
+                entries = await session_store.load(
+                    {
+                        "project_key": project_key,
+                        "session_id": session_id,
+                        "subpath": "",
+                    }
+                )
+                if entries:
+                    return True
+            except Exception:
+                logger.exception("session_store.load failed in existence check")
+        if artefact_store is not None:
+            try:
+                rows = await artefact_store.list_for_session(session_id=session_id)
+                if rows:
+                    return True
+            except Exception:
+                logger.exception("artefact_store list failed in existence check")
+        return False
 
     @app.get("/sessions/{session_id}/messages", dependencies=[Depends(auth_dep)])
     async def get_messages(session_id: str) -> JSONResponse:
-        s = _ensure_session(session_id)
-        # Snapshot of completed messages in arrival order. Cheap copy — list
-        # assignment, not a deep clone — because messages are dicts the client
-        # treats as read-only (they came off the wire).
+        if not await _session_known(session_id):
+            raise HTTPException(status_code=404, detail="Session not found")
+        msgs, last_seq = await _resolve_messages(session_id)
         return JSONResponse(
             {
                 "session_id": session_id,
-                "last_event_id": s.event_log.last_seq,
-                "messages": list(s.messages),
+                "last_event_id": last_seq,
+                "messages": msgs,
             }
         )
 
@@ -393,7 +467,9 @@ def create_app(
             response_model=list[ArtefactSummaryResponse],
         )
         async def list_artefacts(session_id: str) -> list[ArtefactSummaryResponse]:
-            _ensure_session(session_id)
+            # No _ensure_session: artefact_store is the source of truth and
+            # outlives the in-memory Session; the per-row session_id check
+            # below blocks cross-session leakage.
             artefacts = await artefact_store.list_for_session(session_id=session_id)
             return [_artefact_summary(a) for a in artefacts]
 
@@ -407,7 +483,9 @@ def create_app(
             artefact_id: str,
             version: Optional[int] = None,
         ) -> ArtefactReadResponse:
-            _ensure_session(session_id)
+            # No _ensure_session: artefact_store is the source of truth and
+            # outlives the in-memory Session; the per-row session_id check
+            # below blocks cross-session leakage.
             try:
                 a, v = await artefact_store.read(
                     artefact_id=artefact_id, version=version
@@ -427,7 +505,9 @@ def create_app(
         async def list_artefact_versions(
             session_id: str, artefact_id: str
         ) -> list[ArtefactVersionResponse]:
-            _ensure_session(session_id)
+            # No _ensure_session: artefact_store is the source of truth and
+            # outlives the in-memory Session; the per-row session_id check
+            # below blocks cross-session leakage.
             try:
                 a = await artefact_store.get(artefact_id=artefact_id)
             except ArtefactNotFoundError as e:
@@ -445,7 +525,9 @@ def create_app(
         async def read_artefact_version(
             session_id: str, artefact_id: str, version: int
         ) -> ArtefactVersionResponse:
-            _ensure_session(session_id)
+            # No _ensure_session: artefact_store is the source of truth and
+            # outlives the in-memory Session; the per-row session_id check
+            # below blocks cross-session leakage.
             try:
                 a, v = await artefact_store.read(
                     artefact_id=artefact_id, version=version
@@ -462,7 +544,10 @@ def create_app(
         response_model=SnapshotResponse,
     )
     async def get_snapshot(session_id: str) -> SnapshotResponse:
-        s = _ensure_session(session_id)
+        # Cold-start safe: hits artefact_store + session_store directly. We
+        # only 404 if neither store nor registry has any record of this id.
+        if not await _session_known(session_id):
+            raise HTTPException(status_code=404, detail="Session not found")
         artefacts: list[ArtefactSummaryResponse] = []
         if artefact_store is not None:
             rows = await artefact_store.list_for_session(session_id=session_id)
@@ -479,11 +564,12 @@ def create_app(
                 )
                 for a in rows
             ]
+        msgs, last_seq = await _resolve_messages(session_id)
         return SnapshotResponse(
             session_id=session_id,
             protocol_version=PROTOCOL_VERSION,
-            last_event_id=s.event_log.last_seq,
-            messages=list(s.messages),
+            last_event_id=last_seq,
+            messages=msgs,
             artefacts=artefacts,
         )
 

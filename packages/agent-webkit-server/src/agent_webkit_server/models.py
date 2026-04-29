@@ -102,6 +102,10 @@ class CreateSessionRequest(BaseModel):
     model: Optional[str] = None
     permission_mode: Optional[str] = None
     cwd: Optional[str] = None
+    # When set, the SDK rehydrates the transcript for this id from its bound
+    # SessionStore instead of starting fresh — paired with ``create_app``'s
+    # ``session_store=`` for cross-instance resume.
+    resume: Optional[str] = None
 
 
 class CreateSessionResponse(BaseModel):
