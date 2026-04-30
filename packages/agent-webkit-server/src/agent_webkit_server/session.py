@@ -76,6 +76,16 @@ class Session:
         # the receive loop sees a ResultMessage (or on interrupt completing drain).
         self._turn_done: asyncio.Event = asyncio.Event()
         self._turn_done.set()
+        # Per-session reduced message buffer. Append-only list of completed
+        # assistant/user messages, kept in arrival order. Used by
+        # ``GET /sessions/{id}/messages`` (and ``/snapshot``) to rehydrate
+        # state for clients that fell off the SSE ring buffer. The buffer
+        # mirrors what the L2 reducer would produce; we maintain it server-side
+        # because the ring buffer is bounded but a chat history should not be.
+        # Initialised here (not in ``start()``) so ``submit_user_message``
+        # can mirror into it even on Session instances tests construct without
+        # calling ``start()``.
+        self.messages: list[dict[str, Any]] = []
 
     def touch(self) -> None:
         self._last_activity = time.monotonic()
@@ -90,14 +100,6 @@ class Session:
             "session_id": self.id,
             "protocol_version": PROTOCOL_VERSION,
         })
-
-        # Per-session reduced message buffer. Append-only list of completed
-        # assistant/user messages, kept in arrival order. Used by
-        # ``GET /sessions/{id}/messages`` (and ``/snapshot``) to rehydrate
-        # state for clients that fell off the SSE ring buffer. The buffer
-        # mirrors what the L2 reducer would produce; we maintain it server-side
-        # because the ring buffer is bounded but a chat history should not be.
-        self.messages: list[dict[str, Any]] = []
 
         # Start the receive-side translator pulling from the SDK.
         self._tasks.append(asyncio.create_task(

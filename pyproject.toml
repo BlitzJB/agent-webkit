@@ -1,9 +1,15 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# importlib mode lets the same basename ("tests/") live under both the repo
+# root and ``packages/agent-webkit-server/`` without colliding in sys.modules.
+# Default "prepend" mode treats each as a top-level ``tests`` package and the
+# second collected file fails with ``ModuleNotFoundError: No module named
+# 'tests.<x>'`` because the first directory shadowed the second.
 addopts = [
     "--cov=packages/agent-webkit-server/src/agent_webkit_server",
     "--cov-report=term-missing",
     "--cov-fail-under=90",
+    "--import-mode=importlib",
 ]
 testpaths = ["tests/unit", "tests/contract", "tests/properties"]
 
