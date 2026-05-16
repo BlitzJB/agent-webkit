@@ -145,16 +145,51 @@ def _coerce_context(ctx: Any) -> dict[str, Any]:
     """Real SDK passes a ToolPermissionContext dataclass; the fake passes a dict.
 
     Returns a JSON-serializable dict either way, so the rest of the bridge can
-    treat the two uniformly and the wire payload stays consistent.
+    treat the two uniformly and the wire payload stays consistent. Nested
+    dataclasses (e.g. ``ToolPermissionContext.suggestions: list[PermissionUpdate]``)
+    are deep-coerced — otherwise ``json.dumps`` on the resulting
+    ``permission_request`` event raises mid-stream and the client falls into
+    an auto-reconnect loop replaying the same poisoned event from the ring
+    buffer.
     """
     if isinstance(ctx, dict):
-        return ctx
+        # Even passthrough dicts may contain nested dataclasses (e.g. a caller
+        # built the context manually from real SDK objects). Walk it.
+        return {k: _to_jsonable(v) for k, v in ctx.items()}
     out: dict[str, Any] = {}
     for attr in ("tool_use_id", "correlation_id", "agent_id", "suggestions"):
         v = getattr(ctx, attr, None)
         if v is not None:
-            out[attr] = v
+            out[attr] = _to_jsonable(v)
     return out
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Best-effort recursive coercion to JSON-native types.
+
+    Plain primitives pass through. Lists/tuples and dicts recurse. Dataclasses
+    (including SDK types like ``PermissionUpdate`` we don't import here) get
+    flattened by introspecting their fields — using ``dataclasses.asdict``
+    where possible, falling back to ``__dict__`` for non-strict cases. Unknown
+    objects fall back to ``str(value)`` so we degrade visibly instead of
+    crashing the SSE generator.
+    """
+    import dataclasses
+
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return _to_jsonable(dataclasses.asdict(value))
+        except Exception:  # pragma: no cover - asdict can choke on non-dc fields
+            return {f.name: _to_jsonable(getattr(value, f.name, None)) for f in dataclasses.fields(value)}
+    if hasattr(value, "__dict__"):
+        return {k: _to_jsonable(v) for k, v in vars(value).items() if not k.startswith("_")}
+    return str(value)
 
 
 _id_counter = 0

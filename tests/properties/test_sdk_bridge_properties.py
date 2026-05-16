@@ -74,13 +74,19 @@ def test_coerce_context_dataclass_yields_json_serializable_dict(
     extra=st.dictionaries(st.text(max_size=6), st.integers(), max_size=4),
     tool_use_id=st.one_of(st.none(), _id_text),
 )
-def test_coerce_context_dict_passes_through_unchanged(extra, tool_use_id) -> None:
-    """When the SDK already passed a dict, ``_coerce_context`` returns it as-is."""
+def test_coerce_context_dict_is_value_preserving_and_jsonable(extra, tool_use_id) -> None:
+    """When the SDK already passed a dict, ``_coerce_context`` must preserve
+    the values verbatim AND guarantee the result is JSON-serializable. (We no
+    longer require object identity — the coercion walks the dict so nested
+    SDK dataclasses, e.g. ``PermissionUpdate`` under ``suggestions``, get
+    flattened to plain dicts. Otherwise the wire ``permission_request`` event
+    poisons the SSE stream and the client falls into a reconnect loop.)"""
     d = dict(extra)
     if tool_use_id is not None:
         d["tool_use_id"] = tool_use_id
     out = _coerce_context(d)
-    assert out is d  # identity: no copy, no rebuild
+    assert out == d
+    json.dumps(out)  # must serialize without raising
 
 
 # --- translate_sdk_messages properties ---------------------------------------
