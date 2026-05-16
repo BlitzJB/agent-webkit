@@ -49,6 +49,17 @@ class FakeSystemMessage:
     status: str = ""
 
 
+@dataclass
+class FakeStreamEvent:
+    """Mirrors claude_agent_sdk.StreamEvent — raw Anthropic streaming events
+    wrapped with session context. Emitted by the real SDK when
+    `include_partial_messages=True`."""
+    uuid: str
+    session_id: str
+    event: dict[str, Any]
+    parent_tool_use_id: Optional[str] = None
+
+
 # Type-name-based mapping in sdk_bridge uses `type(msg).__name__` — match those names.
 class AssistantMessage(FakeAssistantMessage):  # type: ignore[misc]
     pass
@@ -63,6 +74,10 @@ class ResultMessage(FakeResultMessage):  # type: ignore[misc]
 
 
 class SystemMessage(FakeSystemMessage):  # type: ignore[misc]
+    pass
+
+
+class StreamEvent(FakeStreamEvent):  # type: ignore[misc]
     pass
 
 
@@ -157,5 +172,12 @@ def _coerce(msg: dict[str, Any]) -> Any:
             subtype=payload.get("subtype", ""),
             server_name=payload.get("server_name", ""),
             status=payload.get("status", ""),
+        )
+    if msg_type == "StreamEvent":
+        return StreamEvent(
+            uuid=payload.get("uuid", "u_x"),
+            session_id=payload.get("session_id", "fake"),
+            event=payload.get("event", {}),
+            parent_tool_use_id=payload.get("parent_tool_use_id"),
         )
     raise ValueError(f"Unknown fixture message type: {msg_type}")

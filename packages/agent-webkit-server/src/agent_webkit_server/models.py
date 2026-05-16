@@ -102,6 +102,9 @@ class CreateSessionRequest(BaseModel):
     model: Optional[str] = None
     permission_mode: Optional[str] = None
     cwd: Optional[str] = None
+    # Opt-in: when true, the bridge asks the SDK for raw stream events and
+    # translates content_block_delta frames into wire `message_delta` events.
+    include_partial_messages: bool = False
 
 
 class CreateSessionResponse(BaseModel):

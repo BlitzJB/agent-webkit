@@ -58,6 +58,8 @@ def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk
             options_kwargs["cwd"] = config.cwd
         if session_store is not None:
             options_kwargs["session_store"] = session_store
+        if config.include_partial_messages:
+            options_kwargs["include_partial_messages"] = True
 
         if genui is not None:
             mcp_server = genui.build_mcp_server()
@@ -136,6 +138,7 @@ def create_app(
             model=req.model,
             permission_mode=req.permission_mode,
             cwd=req.cwd,
+            include_partial_messages=req.include_partial_messages,
         )
         s = await registry.create(config)
         return CreateSessionResponse(session_id=s.id, protocol_version=PROTOCOL_VERSION)

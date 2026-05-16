@@ -34,10 +34,15 @@ class SessionConfig:
         model: Optional[str] = None,
         permission_mode: Optional[str] = None,
         cwd: Optional[str] = None,
+        include_partial_messages: bool = False,
     ) -> None:
         self.model = model
         self.permission_mode = permission_mode
         self.cwd = cwd
+        # When True the SDK is asked to emit raw Anthropic stream events, which
+        # the bridge translates into `message_delta` wire events so clients can
+        # render assistant text token-by-token.
+        self.include_partial_messages = include_partial_messages
 
 
 class Session:

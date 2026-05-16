@@ -171,6 +171,7 @@ try:  # pragma: no cover — exercised in environments with the real SDK install
     from claude_agent_sdk import (  # type: ignore
         AssistantMessage as _SDKAssistantMessage,
         ResultMessage as _SDKResultMessage,
+        StreamEvent as _SDKStreamEvent,
         SystemMessage as _SDKSystemMessage,
         UserMessage as _SDKUserMessage,
     )
@@ -179,6 +180,7 @@ try:  # pragma: no cover — exercised in environments with the real SDK install
         "UserMessage": _SDKUserMessage,
         "ResultMessage": _SDKResultMessage,
         "SystemMessage": _SDKSystemMessage,
+        "StreamEvent": _SDKStreamEvent,
     }
 except ImportError:
     _SDK_TYPES = {}
@@ -199,9 +201,55 @@ def _classify(msg: Any) -> str:
 
 async def translate_sdk_messages(messages: Any, emit: Callable[[str, dict[str, Any]], None]) -> None:
     """Pull from the SDK's async iterator and translate to wire events."""
+    # Streaming state. The SDK's StreamEvent stream interleaves message_start /
+    # content_block_start / content_block_delta / ... events; we need a tiny
+    # state machine to attribute deltas to the right message_id and tool_use_id.
+    cur_message_id: Optional[str] = None
+    open_blocks: dict[int, dict[str, Any]] = {}
+
     async for msg in messages:
         try:
             kind = _classify(msg)
+            if kind == "StreamEvent":
+                ev = getattr(msg, "event", None) or {}
+                etype = ev.get("type")
+                if etype == "message_start":
+                    cur_message_id = ((ev.get("message") or {}).get("id")) or cur_message_id
+                    open_blocks.clear()
+                elif etype == "content_block_start":
+                    idx = ev.get("index")
+                    blk = ev.get("content_block") or {}
+                    if idx is not None:
+                        open_blocks[idx] = blk
+                elif etype == "content_block_delta":
+                    if cur_message_id is None:
+                        continue
+                    delta = ev.get("delta") or {}
+                    dtype = delta.get("type")
+                    if dtype == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            emit("message_delta", {
+                                "message_id": cur_message_id,
+                                "delta": {"type": "text", "text": text},
+                            })
+                    elif dtype == "input_json_delta":
+                        idx = ev.get("index")
+                        blk = open_blocks.get(idx) if idx is not None else None
+                        forwarded = dict(delta)
+                        if blk and blk.get("type") == "tool_use":
+                            forwarded.setdefault("tool_use_id", blk.get("id"))
+                            if blk.get("name") is not None:
+                                forwarded.setdefault("name", blk["name"])
+                        emit("message_delta", {
+                            "message_id": cur_message_id,
+                            "delta": forwarded,
+                        })
+                    # other delta types (e.g. thinking_delta, signature_delta) are
+                    # not part of the wire protocol yet — silently ignore.
+                # ping / message_delta(stop_reason) / message_stop / content_block_stop
+                # don't produce wire events — message_complete carries the final state.
+                continue
             if kind == "AssistantMessage":
                 # Final assistant message — emit as message_complete.
                 content = _serialize_blocks(getattr(msg, "content", []))
