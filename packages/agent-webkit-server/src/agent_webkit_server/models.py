@@ -112,6 +112,21 @@ class CreateSessionResponse(BaseModel):
     protocol_version: str = "1.0"
 
 
+class SessionListEntry(BaseModel):
+    id: str
+    sdk_session_id: Optional[str] = None
+    model: Optional[str] = None
+    permission_mode: Optional[str] = None
+    cwd: Optional[str] = None
+    include_partial_messages: bool = False
+    created_at: float
+    last_seen_at: float
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionListEntry]
+
+
 # --- Outbound event payloads (for documentation; the event log stores dicts) ---
 
 class SessionReadyData(BaseModel):

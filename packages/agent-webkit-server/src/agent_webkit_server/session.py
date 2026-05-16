@@ -343,6 +343,13 @@ class SessionRegistry:
     def get(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)
 
+    async def list_persisted(self) -> list[SessionMetadata]:
+        """Return every session known to the metadata store. Empty when no
+        store is configured (in-memory mode)."""
+        if self._metadata_store is None:
+            return []
+        return await self._metadata_store.list()
+
     async def get_or_resume(self, session_id: str) -> Optional[Session]:
         """Return the in-memory session, or rebuild it from persisted metadata.
 

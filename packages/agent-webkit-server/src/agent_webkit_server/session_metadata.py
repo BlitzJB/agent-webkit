@@ -60,6 +60,7 @@ class SessionMetadataStore(Protocol):
     async def save(self, metadata: SessionMetadata) -> None: ...
     async def load(self, session_id: str) -> Optional[SessionMetadata]: ...
     async def delete(self, session_id: str) -> None: ...
+    async def list(self) -> list[SessionMetadata]: ...
 
 
 class FileSessionMetadataStore:
@@ -137,3 +138,20 @@ class FileSessionMetadataStore:
             await asyncio.to_thread(path.unlink)
         except FileNotFoundError:
             pass
+
+    async def list(self) -> list[SessionMetadata]:
+        """Enumerate every persisted session. Files that fail to parse are
+        skipped (logged); a single corrupt entry must not block the listing."""
+        entries = await asyncio.to_thread(self._scan_dir)
+        out: list[SessionMetadata] = []
+        for path in entries:
+            try:
+                raw = await asyncio.to_thread(path.read_text)
+                out.append(SessionMetadata.from_dict(json.loads(raw)))
+            except (json.JSONDecodeError, KeyError, ValueError, FileNotFoundError) as e:
+                logger.warning("Skipping unreadable session metadata %s: %s", path.name, e)
+        return out
+
+    def _scan_dir(self) -> list[Path]:
+        # Filter to *.json (skip tmp files from in-flight writes).
+        return [p for p in self._dir.iterdir() if p.suffix == ".json" and p.is_file()]

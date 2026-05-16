@@ -18,6 +18,8 @@ from ..event_log import EvictedError
 from ..models import (
     CreateSessionRequest,
     CreateSessionResponse,
+    SessionListEntry,
+    SessionListResponse,
     InboundMessage,
 )
 from ..sdk_bridge import ConflictError, SDKClient
@@ -137,6 +139,30 @@ def create_app(
         @app.get("/genui/schema")
         async def genui_schema() -> JSONResponse:
             return JSONResponse(genui.schema_payload())
+
+    @app.get("/sessions", response_model=SessionListResponse, dependencies=[Depends(auth_dep)])
+    async def list_sessions() -> SessionListResponse:
+        """Enumerate every session known to the metadata store.
+
+        Returned regardless of whether the session is currently in memory —
+        the point is "what can the user resume?" The list is empty when
+        ``create_app`` was built without a ``metadata_store`` (pure in-memory
+        mode), since there's nothing durable to enumerate.
+        """
+        records = await registry.list_persisted()
+        return SessionListResponse(sessions=[
+            SessionListEntry(
+                id=r.id,
+                sdk_session_id=r.sdk_session_id,
+                model=r.model,
+                permission_mode=r.permission_mode,
+                cwd=r.cwd,
+                include_partial_messages=r.include_partial_messages,
+                created_at=r.created_at,
+                last_seen_at=r.last_seen_at,
+            )
+            for r in records
+        ])
 
     @app.post("/sessions", response_model=CreateSessionResponse, dependencies=[Depends(auth_dep)])
     async def create_session(req: CreateSessionRequest) -> CreateSessionResponse:

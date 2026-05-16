@@ -84,3 +84,43 @@ async def test_invalid_session_id_rejected(tmp_path) -> None:
     # Load/delete with a bad id silently return / no-op.
     assert await store.load("../escaped") is None
     await store.delete("../escaped")
+
+
+@pytest.mark.asyncio
+async def test_list_returns_all_saved_metadata(tmp_path) -> None:
+    store = FileSessionMetadataStore(tmp_path)
+    a = SessionMetadata(id=str(uuid.uuid4()), sdk_session_id="a", cwd="/work/a")
+    b = SessionMetadata(id=str(uuid.uuid4()), sdk_session_id="b", cwd="/work/b")
+    await store.save(a)
+    await store.save(b)
+    listed = await store.list()
+    ids = sorted(m.id for m in listed)
+    assert ids == sorted([a.id, b.id])
+
+
+@pytest.mark.asyncio
+async def test_list_skips_corrupt_files_without_raising(tmp_path) -> None:
+    store = FileSessionMetadataStore(tmp_path)
+    good = SessionMetadata(id=str(uuid.uuid4()))
+    await store.save(good)
+    # Drop a junk file alongside — list() must not raise.
+    (tmp_path / f"{uuid.uuid4()}.json").write_text("not json")
+    listed = await store.list()
+    assert any(m.id == good.id for m in listed)
+
+
+@pytest.mark.asyncio
+async def test_list_ignores_tmp_files_from_in_flight_writes(tmp_path) -> None:
+    store = FileSessionMetadataStore(tmp_path)
+    good = SessionMetadata(id=str(uuid.uuid4()))
+    await store.save(good)
+    # Simulate a tmp file left behind by a crashed write.
+    (tmp_path / f"{uuid.uuid4()}.json.tmp.abc123").write_text("{}")
+    listed = await store.list()
+    assert [m.id for m in listed] == [good.id]
+
+
+@pytest.mark.asyncio
+async def test_list_empty_on_fresh_directory(tmp_path) -> None:
+    store = FileSessionMetadataStore(tmp_path / "fresh")
+    assert await store.list() == []
