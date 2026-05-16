@@ -93,7 +93,13 @@ async def test_get_or_resume_rebuilds_lost_session_with_resume_flag(tmp_path) ->
     )
 
     # Phase 1: create and drive to completion so sdk_session_id is captured.
-    s1 = await registry.create(SessionConfig(model="claude-opus-4-7", permission_mode="default"))
+    # cwd MUST round-trip through resume — the SDK looks up the transcript by
+    # cwd-hash, so a different cwd on rebuild would fail to find it.
+    s1 = await registry.create(SessionConfig(
+        model="claude-opus-4-7",
+        permission_mode="default",
+        cwd="/work/repo-a",
+    ))
     await s1.submit_user_message("hi")
     for _ in range(50):
         if s1.sdk_session_id is not None:
@@ -118,6 +124,9 @@ async def test_get_or_resume_rebuilds_lost_session_with_resume_flag(tmp_path) ->
     assert rebuild_cfg.resume == "fake-1"
     assert rebuild_cfg.model == "claude-opus-4-7"
     assert rebuild_cfg.permission_mode == "default"
+    # Crucially: the cwd must match what was provided on the original create.
+    # Diverging here breaks SDK transcript lookup and resume silently fails.
+    assert rebuild_cfg.cwd == "/work/repo-a"
     await registry.shutdown()
 
 
