@@ -395,16 +395,17 @@ class SessionRegistry:
         metadata = await self._metadata_store.load(session_id)
         if metadata is None:
             return None
-        if metadata.sdk_session_id is None:
-            # We persisted the wrapper id but the SDK never produced a session
-            # id (first turn never completed). Nothing to resume against.
-            return None
+        # When sdk_session_id is None the SDK never completed a turn (typical
+        # case: user opened the page, created the session, and refreshed
+        # before typing anything). There's no transcript to resume, but the
+        # wrapper id and config are still valid — spin up a fresh SDK client
+        # under the same wrapper so the user can keep using the same session.
         config = SessionConfig(
             model=metadata.model,
             permission_mode=metadata.permission_mode,
             cwd=metadata.cwd,
             include_partial_messages=metadata.include_partial_messages,
-            resume=metadata.sdk_session_id,
+            resume=metadata.sdk_session_id,  # may be None — factory will skip resume=
         )
         try:
             session = await self._build_session(session_id, config)

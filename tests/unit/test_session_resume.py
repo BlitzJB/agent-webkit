@@ -142,22 +142,32 @@ async def test_get_or_resume_returns_none_for_unknown_id(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_not_attempted_without_sdk_session_id(tmp_path) -> None:
-    """If we crashed before the first ResultMessage, sdk_session_id was never
-    captured. There's nothing to resume against — return None instead of
-    starting a brand-new session under the old UUID (which would silently
-    lose the user's intent)."""
+async def test_metadata_without_sdk_session_id_starts_fresh_under_same_wrapper(tmp_path) -> None:
+    """Metadata-only entries (user created the session but refreshed before
+    typing — no ResultMessage, no sdk_session_id) must still be resumable:
+    spin up a fresh SDK client under the same wrapper id, no resume=.
+    Refusing here would leave the user stranded with a 404 on a session id
+    they're holding."""
     store = FileSessionMetadataStore(tmp_path)
     sid = "11111111-1111-1111-1111-111111111111"
-    await store.save(SessionMetadata(id=sid, sdk_session_id=None))
+    await store.save(SessionMetadata(
+        id=sid, sdk_session_id=None, cwd="/work/x", model="claude-opus-4-7",
+    ))
 
     captured: list[SessionConfig] = []
     registry = SessionRegistry(
         _factory_capturing(captured, "plain_qa"),
         metadata_store=store,
     )
-    assert await registry.get_or_resume(sid) is None
-    assert captured == []  # factory never invoked
+    s = await registry.get_or_resume(sid)
+    assert s is not None
+    assert s.id == sid
+    # Factory was invoked with the original config and resume=None (fresh start).
+    assert len(captured) == 1
+    assert captured[0].resume is None
+    assert captured[0].cwd == "/work/x"
+    assert captured[0].model == "claude-opus-4-7"
+    await registry.shutdown()
 
 
 @pytest.mark.asyncio
