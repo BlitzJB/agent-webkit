@@ -106,10 +106,35 @@ export function reduce(state: AgentState, action: Action): AgentState {
       };
 
     case "server_event": {
-      const ev: ServerEvent = action.event;
+      const ev = action.event;
       switch (ev.event) {
         case "session_ready":
           return state;
+
+        case "user_message": {
+          // The server echoes every accepted user turn into the event log so
+          // attaching mid-conversation replays the full transcript. When the
+          // user typed this live in *this* client we already did an optimistic
+          // local_user_message insert — dedupe by content match against the
+          // most recent user-kind message to avoid showing the same prompt
+          // twice. (Pure replay case: no prior local insert, just append.)
+          const content = ev.data.content;
+          const last = state.messages[state.messages.length - 1];
+          if (
+            last &&
+            last.kind === "user" &&
+            JSON.stringify(last.content) === JSON.stringify(content)
+          ) {
+            return state;
+          }
+          return {
+            ...state,
+            messages: [
+              ...state.messages,
+              { kind: "user", id: `srv-${ev.id}`, content },
+            ],
+          };
+        }
 
         case "message_delta": {
           const { message_id, delta } = ev.data;

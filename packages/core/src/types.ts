@@ -49,6 +49,7 @@ export type InboundMessage =
 
 export type ServerEvent =
   | { event: "session_ready"; data: { session_id: string; protocol_version: string } }
+  | { event: "user_message"; data: { content: string | ContentBlock[] } }
   | { event: "message_delta"; data: { message_id: string; delta: ContentBlock | { text: string } } }
   | { event: "message_complete"; data: { message_id: string; message: AssistantMessage } }
   | {

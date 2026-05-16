@@ -195,6 +195,7 @@ class McpStatusChangeData(BaseModel):
 # Names of all valid outbound events. Used for contract validation.
 OUTBOUND_EVENT_NAMES: frozenset[str] = frozenset({
     "session_ready",
+    "user_message",
     "message_delta",
     "message_complete",
     "tool_use",
