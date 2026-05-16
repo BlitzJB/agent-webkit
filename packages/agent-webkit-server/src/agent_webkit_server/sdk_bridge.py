@@ -27,6 +27,7 @@ try:
     from claude_agent_sdk.types import (  # type: ignore
         PermissionResultAllow,
         PermissionResultDeny,
+        PermissionUpdate as _SDKPermissionUpdate,
     )
 except ImportError:  # pragma: no cover — used in test environments without the real SDK.
     @dataclass
@@ -38,6 +39,8 @@ except ImportError:  # pragma: no cover — used in test environments without th
     class PermissionResultDeny:  # type: ignore[no-redef]
         message: Optional[str] = None
         interrupt: bool = False
+
+    _SDKPermissionUpdate = None  # type: ignore[assignment]
 
 
 # Protocol the bridge depends on. The real ClaudeSDKClient and our fake_claude_sdk both
@@ -135,7 +138,14 @@ def build_can_use_tool(emit: Callable[[str, dict[str, Any]], None], router: Perm
             if decision.get("updated_input") is not None:
                 kwargs["updated_input"] = decision["updated_input"]
             if decision.get("updated_permissions") is not None:
-                kwargs["updated_permissions"] = decision["updated_permissions"]
+                # The wire carries dicts (see _coerce_context above), but the
+                # SDK expects PermissionUpdate dataclasses and later calls
+                # `.to_dict()` on each. Hydrate them back here — failing to
+                # do so manifests as: `'dict' object has no attribute 'to_dict'`
+                # the moment a user clicks an "Always allow" suggestion chip.
+                kwargs["updated_permissions"] = [
+                    _hydrate_permission_update(p) for p in decision["updated_permissions"]
+                ]
             return PermissionResultAllow(**kwargs)
         else:
             kwargs2: dict[str, Any] = {}
@@ -174,12 +184,12 @@ def _coerce_context(ctx: Any) -> dict[str, Any]:
 def _to_jsonable(value: Any) -> Any:
     """Best-effort recursive coercion to JSON-native types.
 
-    Plain primitives pass through. Lists/tuples and dicts recurse. Dataclasses
-    (including SDK types like ``PermissionUpdate`` we don't import here) get
-    flattened by introspecting their fields — using ``dataclasses.asdict``
-    where possible, falling back to ``__dict__`` for non-strict cases. Unknown
-    objects fall back to ``str(value)`` so we degrade visibly instead of
-    crashing the SSE generator.
+    Plain primitives pass through. Lists/tuples and dicts recurse. Objects
+    that expose ``to_dict()`` get their canonical dict form (this is how SDK
+    types like ``PermissionUpdate`` round-trip into the control-protocol
+    shape with camelCase keys). Other dataclasses fall back to
+    ``dataclasses.asdict``. Unknown objects degrade to ``str(value)`` so
+    we never crash the SSE generator.
     """
     import dataclasses
 
@@ -189,6 +199,15 @@ def _to_jsonable(value: Any) -> Any:
         return [_to_jsonable(v) for v in value]
     if isinstance(value, dict):
         return {str(k): _to_jsonable(v) for k, v in value.items()}
+    # Prefer an explicit `to_dict()` — that's the SDK's intended wire shape
+    # (e.g. PermissionUpdate.to_dict produces camelCase rule keys that
+    # round-trip cleanly through PermissionUpdate.from_dict).
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return _to_jsonable(to_dict())
+        except Exception:  # pragma: no cover - defensive
+            pass
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         try:
             return _to_jsonable(dataclasses.asdict(value))
@@ -197,6 +216,28 @@ def _to_jsonable(value: Any) -> Any:
     if hasattr(value, "__dict__"):
         return {k: _to_jsonable(v) for k, v in vars(value).items() if not k.startswith("_")}
     return str(value)
+
+
+def _hydrate_permission_update(value: Any) -> Any:
+    """Convert a wire-shape dict back into an SDK ``PermissionUpdate``.
+
+    The client sends suggestions back verbatim from what we emitted via
+    ``_coerce_context`` — which used ``PermissionUpdate.to_dict()``, so the
+    dict already matches the SDK's control-protocol shape. We pass it
+    through ``PermissionUpdate.from_dict`` to rebuild the dataclass the SDK
+    expects. If the SDK isn't importable (tests) or the value is already a
+    PermissionUpdate, return it unchanged.
+    """
+    if _SDKPermissionUpdate is None:
+        return value
+    if isinstance(value, _SDKPermissionUpdate):
+        return value
+    if isinstance(value, dict):
+        try:
+            return _SDKPermissionUpdate.from_dict(value)
+        except Exception:  # pragma: no cover - defensive: malformed input
+            return value
+    return value
 
 
 _id_counter = 0
