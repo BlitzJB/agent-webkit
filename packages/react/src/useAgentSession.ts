@@ -10,6 +10,23 @@ import {
   type Session,
   type UserInput,
 } from "@agent-webkit/core";
+
+// The L1 transport already reconnects-with-Last-Event-ID on transient
+// network errors (the typical laptop-sleep case). A bubbled error reaching
+// this hook means the connection is unrecoverable — most commonly because
+// the server-side session itself has been reaped or restarted.
+//
+// We surface those with a *specific* code so callers can render a clear
+// "this session is gone, start a new one" affordance instead of treating
+// it as a generic stream_error.
+function errorCodeFor(err: unknown): string {
+  if (err instanceof TransportError) {
+    if (err.status === 404) return "session_not_found";
+    if (err.status === 412) return "session_evicted";
+    if (err.status === 401 || err.status === 403) return "unauthorized";
+  }
+  return "stream_error";
+}
 import {
   initialState,
   reduce,
@@ -36,27 +53,6 @@ export interface UseAgentSessionOptions {
    * without forking the connection.
    */
   onEvent?: (event: DeliveredEvent) => void;
-  /**
-   * When the stream fails because the server-side session is gone (404) or
-   * its ring buffer evicted our cursor (412), silently create a new session
-   * and continue. Only applies when the caller did NOT pass `sessionId`
-   * (attached sessions are caller-owned). Defaults to true.
-   */
-  autoRecover?: boolean;
-  /**
-   * How many recovery attempts to make per loss before giving up and
-   * surfacing a `stream_error`. Defaults to 5.
-   */
-  maxRecoveryAttempts?: number;
-}
-
-// HTTP statuses where the right move is to throw away the current sessionId
-// and create a fresh one. 404 = session reaped server-side; 412 = ring-buffer
-// evicted our Last-Event-ID and we can't resume.
-const RECOVERABLE_STATUSES: ReadonlySet<number> = new Set([404, 412]);
-
-function isRecoverableTransportError(err: unknown): boolean {
-  return err instanceof TransportError && err.status !== undefined && RECOVERABLE_STATUSES.has(err.status);
 }
 
 export interface UseAgentSessionReturn extends AgentState {
@@ -86,15 +82,7 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
   const closedRef = useRef(false);
 
   // We deliberately re-key on baseUrl/sessionId/token, not the whole opts object.
-  const {
-    baseUrl,
-    token,
-    sessionId: attachSessionId,
-    resumeFromEventId,
-    autoStart = true,
-    autoRecover = true,
-    maxRecoveryAttempts = 5,
-  } = opts;
+  const { baseUrl, token, sessionId: attachSessionId, resumeFromEventId, autoStart = true } = opts;
   const createOpts = opts.create;
   const injectedClient = opts.client;
   const onEventRef = useRef(opts.onEvent);
@@ -109,86 +97,60 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
     const client = injectedClient ?? createAgentClient(clientOpts);
 
     let aborted = false;
-    let recoveryAttempts = 0;
-
-    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-    const emitError = (code: string, message: string): void => {
-      dispatch({
-        type: "server_event",
-        event: { id: -1, event: "error", data: { code, message } },
-      });
-    };
 
     (async () => {
-      // Outer loop: recreate session on recoverable failures (404/412). Inner
-      // try/catch handles per-stream errors; we either break (fatal / aborted /
-      // attached-session loss) or `continue` (transparent recreate).
-      while (!aborted) {
-        let session: Session;
-        try {
-          if (attachSessionId) {
-            const attachOpts = resumeFromEventId !== undefined ? { resumeFromEventId } : {};
-            session = client.attachSession(attachSessionId, attachOpts) as Session;
-          } else {
-            session = await client.createSession(createOpts);
-          }
-        } catch (err) {
-          if (!aborted) {
-            emitError(
-              "stream_error",
-              err instanceof Error ? err.message : String(err)
-            );
-          }
-          return;
-        }
+      let session: Session;
+      if (attachSessionId) {
+        const attachOpts = resumeFromEventId !== undefined ? { resumeFromEventId } : {};
+        session = client.attachSession(attachSessionId, attachOpts) as Session;
+      } else {
+        session = await client.createSession(createOpts);
+      }
+      if (aborted) {
+        // StrictMode raced us — abort the local stream but leave the server
+        // session alive. Cleanup happens via reaper / explicit close().
+        session.detach();
+        return;
+      }
+      sessionRef.current = session;
+      setSessionId(session.id);
 
-        if (aborted) {
-          // StrictMode raced us — abort the local stream but leave the server
-          // session alive. Cleanup happens via reaper / explicit close().
-          session.detach();
-          return;
-        }
-        sessionRef.current = session;
-        setSessionId(session.id);
-
-        try {
-          for await (const ev of session.events()) {
-            if (aborted) break;
-            const tap = onEventRef.current;
-            if (tap) {
-              try {
-                tap(ev);
-              } catch {
-                /* taps must not break the reducer pipeline */
-              }
+      try {
+        for await (const ev of session.events()) {
+          if (aborted) break;
+          const tap = onEventRef.current;
+          if (tap) {
+            try {
+              tap(ev);
+            } catch {
+              /* taps must not break the reducer pipeline */
             }
-            dispatch({ type: "server_event", event: ev });
           }
-          // Stream ended cleanly (server emitted `done`). Don't recreate.
-          return;
-        } catch (err) {
-          if (aborted) return;
-          // Decide: silent recovery, or surface the error.
-          const recoverable =
-            autoRecover &&
-            !attachSessionId &&
-            isRecoverableTransportError(err) &&
-            recoveryAttempts < maxRecoveryAttempts;
-
-          if (!recoverable) {
-            emitError(
-              "stream_error",
-              err instanceof Error ? err.message : String(err)
-            );
-            return;
-          }
-
-          // Backoff with light jitter, then loop to create a new session.
-          recoveryAttempts += 1;
-          const backoff = Math.min(250 * 2 ** (recoveryAttempts - 1), 4000);
-          await sleep(backoff + Math.random() * 100);
-          // Continue the while-loop: fresh createSession + events().
+          dispatch({ type: "server_event", event: ev });
+        }
+      } catch (err) {
+        if (!aborted) {
+          // The L1 transport already reconnects-with-Last-Event-ID through
+          // transient network drops (the typical laptop-sleep case) — the
+          // server-side session persists, the SSE socket gets re-established,
+          // missed events replay from the ring buffer. An error reaching here
+          // means the connection is genuinely unrecoverable: most often the
+          // server has reaped the session (idle timeout) or restarted. We
+          // surface it with a specific code (`session_not_found`,
+          // `session_evicted`, `unauthorized`) so callers can render a clear
+          // "start a new session" affordance instead of silently swapping in
+          // a fresh agent and hiding the context loss.
+          dispatch({
+            type: "server_event",
+            event: {
+              id: -1,
+              event: "error",
+              data: {
+                code: errorCodeFor(err),
+                message: err instanceof Error ? err.message : String(err),
+              },
+            },
+          });
         }
       }
     })();
@@ -207,7 +169,7 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
       sessionRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [baseUrl, token, attachSessionId, autoStart, autoRecover, maxRecoveryAttempts, injectedClient]);
+  }, [baseUrl, token, attachSessionId, autoStart, injectedClient]);
 
   const requireSession = (): Session => {
     const s = sessionRef.current;

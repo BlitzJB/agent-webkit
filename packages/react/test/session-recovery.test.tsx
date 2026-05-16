@@ -1,13 +1,16 @@
 /**
- * useAgentSession — auto-recovery on session loss
+ * useAgentSession — error surfacing on unrecoverable stream failures
  *
- * Server-side sessions are reaped after idle (default 5 min) and any
- * subsequent /stream request returns 404. When the L1 transport surfaces
- * that as a `TransportError(status=404)`, L2 should silently create a fresh
- * session and continue, *as long as* the caller didn't explicitly attach to
- * a specific sessionId (in which case lifecycle is theirs to manage).
+ * The L1 transport handles transient drops (laptop sleep, brief network
+ * blips) by reconnecting to the same session with `Last-Event-ID` so missed
+ * events replay from the server's ring buffer. An error reaching the L2
+ * hook means the connection is genuinely lost: the server-side session has
+ * been reaped, evicted, or refuses our auth.
  *
- * This is the laptop-wake / dev-server-restart scenario.
+ * We do NOT silently mint a new session in that case — doing so would hide
+ * the agent-context loss from the user. Instead we surface a specific error
+ * code so the UI can render a clear "session expired, start a new one"
+ * affordance.
  *
  * @vitest-environment happy-dom
  */
@@ -22,33 +25,14 @@ import type {
 import { TransportError } from "@agent-webkit/core";
 import { useAgentSession } from "../src/useAgentSession.js";
 
-// ---------- helpers ----------
-
 type ControllableSession = {
   session: Session;
-  push: (ev: DeliveredEvent) => void;
   fail: (err: unknown) => void;
-  endStream: () => void;
 };
 
 function makeControllableSession(id: string): ControllableSession {
-  const queue: DeliveredEvent[] = [];
-  let resolveNext:
-    | ((v: IteratorResult<DeliveredEvent>) => void)
-    | null = null;
   let rejectNext: ((err: unknown) => void) | null = null;
-  let ended = false;
-
-  const push = (ev: DeliveredEvent): void => {
-    if (resolveNext) {
-      const r = resolveNext;
-      resolveNext = null;
-      rejectNext = null;
-      r({ value: ev, done: false });
-    } else {
-      queue.push(ev);
-    }
-  };
+  let resolveNext: ((v: IteratorResult<DeliveredEvent>) => void) | null = null;
 
   const fail = (err: unknown): void => {
     if (rejectNext) {
@@ -56,16 +40,6 @@ function makeControllableSession(id: string): ControllableSession {
       rejectNext = null;
       resolveNext = null;
       r(err);
-    }
-  };
-
-  const endStream = (): void => {
-    ended = true;
-    if (resolveNext) {
-      const r = resolveNext;
-      resolveNext = null;
-      rejectNext = null;
-      r({ value: undefined as unknown as DeliveredEvent, done: true });
     }
   };
 
@@ -78,12 +52,6 @@ function makeControllableSession(id: string): ControllableSession {
         [Symbol.asyncIterator](): AsyncIterator<DeliveredEvent> {
           return {
             next(): Promise<IteratorResult<DeliveredEvent>> {
-              if (queue.length > 0) {
-                return Promise.resolve({ value: queue.shift()!, done: false });
-              }
-              if (ended) {
-                return Promise.resolve({ value: undefined as any, done: true });
-              }
               return new Promise((resolve, reject) => {
                 resolveNext = resolve;
                 rejectNext = reject;
@@ -101,114 +69,73 @@ function makeControllableSession(id: string): ControllableSession {
     setPermissionMode: vi.fn(async () => {}),
     setModel: vi.fn(async () => {}),
     stopTask: vi.fn(async () => {}),
-    detach: vi.fn(() => endStream()),
-    close: vi.fn(async () => endStream()),
+    detach: vi.fn(),
+    close: vi.fn(async () => {}),
   } as Session;
 
-  return { session, push, fail, endStream };
+  return { session, fail };
 }
 
-function makeRecoveringClient(sessions: ControllableSession[]): {
-  client: AgentClient;
-  createCount: { n: number };
-  attachCount: { n: number };
-} {
+function makeClient(s: Session): { client: AgentClient; createCount: { n: number } } {
   const createCount = { n: 0 };
-  const attachCount = { n: 0 };
   const client: AgentClient = {
     async createSession(_: CreateSessionOptions | undefined) {
-      const s = sessions[createCount.n] ?? sessions[sessions.length - 1];
       createCount.n++;
-      return s!.session as Session;
+      return s as Session;
     },
     attachSession(_id: string) {
-      attachCount.n++;
-      return (sessions[0]!.session) as Session;
+      return s as Session;
     },
   };
-  return { client, createCount, attachCount };
+  return { client, createCount };
 }
 
-// ---------- tests ----------
-
-describe("useAgentSession — auto-recovery", () => {
-  it("recreates the session when the stream fails with 404", async () => {
+describe("useAgentSession — unrecoverable stream errors surface with specific codes", () => {
+  it("404 from the stream surfaces as code `session_not_found`", async () => {
     const a = makeControllableSession("sess-A");
-    const b = makeControllableSession("sess-B");
-    const { client, createCount } = makeRecoveringClient([a, b]);
+    const { client, createCount } = makeClient(a.session);
 
     const { result } = renderHook(() =>
       useAgentSession({ baseUrl: "http://test", client })
     );
-
     await waitFor(() => expect(result.current.sessionId).toBe("sess-A"));
-    expect(createCount.n).toBe(1);
 
-    // Server reaped the session — stream returns 404.
     act(() => {
       a.fail(new TransportError("Stream /sessions/sess-A/stream failed: 404", 404));
     });
 
-    // L2 should silently recreate.
-    await waitFor(() => expect(result.current.sessionId).toBe("sess-B"));
-    expect(createCount.n).toBe(2);
-    // No error surfaced — the recovery is transparent.
-    expect(result.current.lastError).toBeNull();
+    await waitFor(() => expect(result.current.lastError).not.toBeNull());
+    expect(result.current.lastError?.code).toBe("session_not_found");
+    // Critically: no silent recreate. The server-side session is gone, the
+    // agent context with it; hiding that would mislead the user.
+    expect(createCount.n).toBe(1);
   });
 
-  it("recreates on 412 (ring-buffer evicted) too", async () => {
+  it("412 (ring-buffer cursor evicted) surfaces as code `session_evicted`", async () => {
     const a = makeControllableSession("sess-A");
-    const b = makeControllableSession("sess-B");
-    const { client, createCount } = makeRecoveringClient([a, b]);
+    const { client, createCount } = makeClient(a.session);
 
     const { result } = renderHook(() =>
       useAgentSession({ baseUrl: "http://test", client })
     );
-
     await waitFor(() => expect(result.current.sessionId).toBe("sess-A"));
 
     act(() => {
       a.fail(new TransportError("evicted", 412));
     });
 
-    await waitFor(() => expect(result.current.sessionId).toBe("sess-B"));
-    expect(createCount.n).toBe(2);
-  });
-
-  it("does NOT recreate when the caller attached to an explicit sessionId", async () => {
-    // attachSession lifecycle is owned by the caller; we surface the error
-    // instead of silently swapping in a fresh server session.
-    const a = makeControllableSession("sess-attached");
-    const { client, createCount } = makeRecoveringClient([a, a]);
-
-    const { result } = renderHook(() =>
-      useAgentSession({
-        baseUrl: "http://test",
-        client,
-        sessionId: "sess-attached",
-      })
-    );
-
-    await waitFor(() => expect(result.current.sessionId).toBe("sess-attached"));
-
-    act(() => {
-      a.fail(new TransportError("404", 404));
-    });
-
     await waitFor(() => expect(result.current.lastError).not.toBeNull());
-    expect(createCount.n).toBe(0);
-    expect(result.current.lastError?.code).toMatch(/stream|recover/i);
+    expect(result.current.lastError?.code).toBe("session_evicted");
+    expect(createCount.n).toBe(1);
   });
 
-  it("does NOT recreate on non-recoverable errors (e.g. 401)", async () => {
-    // 401 is an auth/config failure — recreating won't help.
+  it("401/403 surface as code `unauthorized`", async () => {
     const a = makeControllableSession("sess-A");
-    const { client, createCount } = makeRecoveringClient([a, a]);
+    const { client } = makeClient(a.session);
 
     const { result } = renderHook(() =>
       useAgentSession({ baseUrl: "http://test", client })
     );
-
     await waitFor(() => expect(result.current.sessionId).toBe("sess-A"));
 
     act(() => {
@@ -216,68 +143,23 @@ describe("useAgentSession — auto-recovery", () => {
     });
 
     await waitFor(() => expect(result.current.lastError).not.toBeNull());
-    expect(createCount.n).toBe(1);
+    expect(result.current.lastError?.code).toBe("unauthorized");
   });
 
-  it("can be opted out via autoRecover: false", async () => {
+  it("non-Transport errors keep the generic `stream_error` code", async () => {
     const a = makeControllableSession("sess-A");
-    const { client, createCount } = makeRecoveringClient([a, a]);
-
-    const { result } = renderHook(() =>
-      useAgentSession({
-        baseUrl: "http://test",
-        client,
-        autoRecover: false,
-      })
-    );
-
-    await waitFor(() => expect(result.current.sessionId).toBe("sess-A"));
-
-    act(() => {
-      a.fail(new TransportError("404", 404));
-    });
-
-    await waitFor(() => expect(result.current.lastError).not.toBeNull());
-    expect(createCount.n).toBe(1);
-  });
-
-  it("preserves existing reducer state across recovery", async () => {
-    // Messages we'd accumulated against session A must survive the swap to
-    // session B — the UX expectation is "I just kept talking" even though
-    // the server agent context has reset.
-    const a = makeControllableSession("sess-A");
-    const b = makeControllableSession("sess-B");
-    const { client } = makeRecoveringClient([a, b]);
+    const { client } = makeClient(a.session);
 
     const { result } = renderHook(() =>
       useAgentSession({ baseUrl: "http://test", client })
     );
-
     await waitFor(() => expect(result.current.sessionId).toBe("sess-A"));
 
     act(() => {
-      a.push({
-        id: 1,
-        event: "message_complete",
-        data: {
-          message_id: "m1",
-          message: {
-            id: "m1",
-            role: "assistant",
-            content: [{ type: "text", text: "hello" }],
-          },
-        },
-      });
+      a.fail(new Error("network unreachable"));
     });
 
-    await waitFor(() => expect(result.current.messages.length).toBe(1));
-
-    act(() => {
-      a.fail(new TransportError("404", 404));
-    });
-
-    await waitFor(() => expect(result.current.sessionId).toBe("sess-B"));
-    // Messages array untouched by the recovery.
-    expect(result.current.messages.length).toBe(1);
+    await waitFor(() => expect(result.current.lastError).not.toBeNull());
+    expect(result.current.lastError?.code).toBe("stream_error");
   });
 });
