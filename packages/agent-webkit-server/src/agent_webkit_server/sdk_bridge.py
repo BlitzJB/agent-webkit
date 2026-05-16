@@ -111,9 +111,16 @@ def build_can_use_tool(emit: Callable[[str, dict[str, Any]], None], router: Perm
                 "questions": tool_input,
             })
             answers = await fut
-            # AskUserQuestion is *answered* by allowing the tool with updated_input that
-            # carries the user's answers. The SDK then surfaces these as the tool's result.
-            return PermissionResultAllow(updated_input={"answers": answers})
+            # AskUserQuestion is answered by allowing the tool with updated_input
+            # carrying the user's answers. Critically, we must preserve the
+            # original tool_input (which contains the `questions` array) — the
+            # tool's call() destructures `{questions, answers}` from its input,
+            # and a missing `questions` makes its renderer crash with
+            # `undefined.map(...)`. User answers take precedence over any
+            # `answers` key the model may have seeded in tool_input.
+            merged: dict[str, Any] = dict(tool_input or {})
+            merged["answers"] = answers
+            return PermissionResultAllow(updated_input=merged)
 
         fut = router.register(correlation_id)
         emit("permission_request", {
