@@ -251,9 +251,16 @@ async def translate_sdk_messages(messages: Any, emit: Callable[[str, dict[str, A
                 # don't produce wire events — message_complete carries the final state.
                 continue
             if kind == "AssistantMessage":
-                # Final assistant message — emit as message_complete.
+                # Final assistant message — emit as message_complete. If the SDK
+                # didn't populate an id (common path), prefer the id we observed
+                # on the most recent `message_start` StreamEvent so the L2
+                # reducer can reconcile this `message_complete` with the
+                # streamed `message_delta`s instead of rendering a duplicate.
                 content = _serialize_blocks(getattr(msg, "content", []))
-                msg_id = getattr(msg, "id", None) or _fallback_id()
+                msg_id = getattr(msg, "id", None) or cur_message_id or _fallback_id()
+                # The id is consumed; the next streamed message gets its own
+                # `message_start` so don't accidentally reuse this id later.
+                cur_message_id = None
                 emit("message_complete", {
                     "message_id": msg_id,
                     "message": {

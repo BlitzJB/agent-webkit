@@ -170,3 +170,36 @@ async def test_streaming_then_complete_preserves_message_id() -> None:
     complete_ids = [d["message_id"] for e, d in out if e == "message_complete"]
     assert delta_ids == ["msg_z"]
     assert complete_ids == ["msg_z"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_then_complete_aligns_id_when_assistant_id_missing() -> None:
+    """Reconciliation bug guard: when AssistantMessage.id is None (common — the
+    SDK doesn't always populate it), `message_complete` must reuse the id from
+    the prior `message_start` instead of fabricating a fresh `corr-N`. Otherwise
+    L2 renders the streamed bubble and a second duplicate bubble side-by-side."""
+    messages = [
+        _se("message_start", message={"id": "msg_real"}),
+        _se("content_block_delta", index=0, delta={"type": "text_delta", "text": "Hi"}),
+        AssistantMessage(id=None, content=[{"type": "text", "text": "Hi there"}]),
+    ]
+    out = await _drain(messages)
+    delta_ids = [d["message_id"] for e, d in out if e == "message_delta"]
+    complete_ids = [d["message_id"] for e, d in out if e == "message_complete"]
+    assert delta_ids == ["msg_real"]
+    assert complete_ids == ["msg_real"], (
+        "message_complete fell back to corr-N instead of reusing the streamed id; "
+        "L2 will render a duplicate bubble"
+    )
+
+
+@pytest.mark.asyncio
+async def test_assistant_message_without_prior_stream_still_uses_fallback() -> None:
+    """Non-streaming path must keep working: no message_start → fallback id."""
+    messages = [
+        AssistantMessage(id=None, content=[{"type": "text", "text": "x"}]),
+    ]
+    out = await _drain(messages)
+    complete_ids = [d["message_id"] for e, d in out if e == "message_complete"]
+    assert len(complete_ids) == 1
+    assert complete_ids[0].startswith("corr-")
