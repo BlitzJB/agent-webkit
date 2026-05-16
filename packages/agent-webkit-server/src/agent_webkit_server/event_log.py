@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Callable, Iterable, Optional
+from typing import Any, AsyncIterator, Iterable, Optional
 
 
 @dataclass
@@ -29,25 +29,19 @@ class EventLog:
         max_size: int = 1000,
         *,
         seed: Optional[Iterable[LoggedEvent]] = None,
-        on_append: Optional[Callable[[LoggedEvent], None]] = None,
     ) -> None:
         """In-memory ring of wire events.
 
         ``seed`` pre-populates the ring (used during resume to replay events
-        persisted by a prior process). The first ``append`` after seeding
-        continues from ``max(seed.seq) + 1`` so the cursor space remains
-        monotonic.
-
-        ``on_append`` fires synchronously after every successful append; the
-        registry uses it to mirror the event to a durable
-        :class:`SessionEventStore` so future resumes can replay it.
+        derived from the SDK's transcript). The first ``append`` after
+        seeding continues from ``max(seed.seq) + 1`` so the cursor space
+        remains monotonic.
         """
         self._max = max_size
         self._buf: deque[LoggedEvent] = deque(maxlen=max_size)
         self._next_seq = 1
         self._waiters: list[asyncio.Event] = []
         self._closed = False
-        self._on_append = on_append
         if seed is not None:
             for ev in seed:
                 self._buf.append(ev)
@@ -64,14 +58,6 @@ class EventLog:
         ev = LoggedEvent(seq=self._next_seq, event=event, data=data)
         self._next_seq += 1
         self._buf.append(ev)
-        if self._on_append is not None:
-            try:
-                self._on_append(ev)
-            except Exception:  # pragma: no cover - defensive: store failures must not block streaming
-                import logging
-                logging.getLogger(__name__).exception(
-                    "on_append hook raised; continuing"
-                )
         # Wake all waiters; they'll re-check their cursor.
         for w in self._waiters:
             w.set()

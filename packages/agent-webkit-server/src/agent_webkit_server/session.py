@@ -17,7 +17,7 @@ from .sdk_bridge import (
     translate_sdk_messages,
 )
 from .session_metadata import SessionMetadata, SessionMetadataStore
-from .session_event_store import SessionEventStore
+from .transcript_replay import transcript_to_events
 
 logger = logging.getLogger(__name__)
 
@@ -258,7 +258,6 @@ class SessionRegistry:
         *,
         idle_timeout_s: float = 300.0,
         metadata_store: Optional[SessionMetadataStore] = None,
-        event_store: Optional[SessionEventStore] = None,
     ) -> None:
         self._sdk_factory = sdk_factory
         self._sessions: dict[str, Session] = {}
@@ -267,11 +266,10 @@ class SessionRegistry:
         # Optional persistent store. When set, sessions survive process
         # restarts and idle reaps — get_or_resume() rebuilds them transparently
         # by passing the captured SDK session id to ClaudeAgentOptions(resume=).
+        # Transcript history on resume is sourced from the SDK's on-disk
+        # transcript via transcript_replay.transcript_to_events — we don't
+        # maintain a duplicate event journal.
         self._metadata_store = metadata_store
-        # Optional durable wire-event log. When set, every event the bridge
-        # emits is mirrored to disk; on resume the EventLog is seeded with the
-        # last N events so attaching clients replay the full transcript.
-        self._event_store = event_store
 
     def start_reaper(self) -> None:  # pragma: no cover - lifespan-managed background task
         if self._reaper_task is None or self._reaper_task.done():
@@ -310,18 +308,16 @@ class SessionRegistry:
         # can be constructed before the SDK client. Factories receive the callback and are
         # expected to install it via their own constructor (e.g. ClaudeAgentOptions.can_use_tool).
         seed: Optional[list[LoggedEvent]] = None
-        if self._event_store is not None and config.resume:
-            # Pre-load the most recent events so any client attaching to the
-            # rebuilt session replays the full transcript instead of seeing
-            # only events from the new process onwards.
-            seed = await self._event_store.load_recent(session_id)
-        on_append = None
-        if self._event_store is not None:
-            store = self._event_store
-            def _mirror(ev: LoggedEvent) -> None:
-                asyncio.create_task(store.append(session_id, ev))
-            on_append = _mirror
-        event_log = EventLog(seed=seed, on_append=on_append)
+        if config.resume:
+            # Hydrate the in-memory ring from the SDK's authoritative on-disk
+            # transcript so attaching clients replay the full conversation
+            # without us maintaining a duplicate journal.
+            replay = await asyncio.to_thread(
+                transcript_to_events, config.resume, config.cwd
+            )
+            if replay:
+                seed = replay
+        event_log = EventLog(seed=seed)
         router = PermissionRouter()
         can_use_tool = build_can_use_tool(event_log.append, router)
         client = await self._invoke_factory(config, can_use_tool)
@@ -419,11 +415,8 @@ class SessionRegistry:
         s = self._sessions.pop(session_id, None)
         if s is not None:
             await s.close()
-        if purge_metadata:
-            if self._metadata_store is not None:
-                await self._metadata_store.delete(session_id)
-            if self._event_store is not None:
-                await self._event_store.delete(session_id)
+        if purge_metadata and self._metadata_store is not None:
+            await self._metadata_store.delete(session_id)
 
     async def shutdown(self) -> None:
         if self._reaper_task is not None:

@@ -99,7 +99,6 @@ def create_app(
     session_store: Any = None,
     genui: Any = None,
     metadata_store: Any = None,
-    event_store: Any = None,
 ) -> FastAPI:
     """Build a FastAPI app exposing the agent-webkit wire protocol.
 
@@ -122,11 +121,7 @@ def create_app(
     auth = auth or AuthConfig.from_env()
     if sdk_factory is None:
         sdk_factory = _make_real_sdk_factory(session_store=session_store, genui=genui)
-    registry = SessionRegistry(
-        sdk_factory,
-        metadata_store=metadata_store,
-        event_store=event_store,
-    )
+    registry = SessionRegistry(sdk_factory, metadata_store=metadata_store)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -135,8 +130,6 @@ def create_app(
             yield
         finally:
             await registry.shutdown()
-            if event_store is not None and hasattr(event_store, "shutdown"):
-                await event_store.shutdown()
 
     app = FastAPI(title="agent-webkit reference server", version="0.1.0", lifespan=lifespan)
 
