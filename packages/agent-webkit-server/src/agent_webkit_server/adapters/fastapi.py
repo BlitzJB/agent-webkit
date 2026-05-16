@@ -60,6 +60,11 @@ def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk
             options_kwargs["session_store"] = session_store
         if config.include_partial_messages:
             options_kwargs["include_partial_messages"] = True
+        if config.resume:
+            # Set by SessionRegistry.get_or_resume when rebuilding a session
+            # whose in-memory state was lost. The SDK loads the prior
+            # transcript from disk and continues the conversation.
+            options_kwargs["resume"] = config.resume
 
         if genui is not None:
             mcp_server = genui.build_mcp_server()
@@ -91,6 +96,7 @@ def create_app(
     sdk_factory=None,
     session_store: Any = None,
     genui: Any = None,
+    metadata_store: Any = None,
 ) -> FastAPI:
     """Build a FastAPI app exposing the agent-webkit wire protocol.
 
@@ -113,7 +119,7 @@ def create_app(
     auth = auth or AuthConfig.from_env()
     if sdk_factory is None:
         sdk_factory = _make_real_sdk_factory(session_store=session_store, genui=genui)
-    registry = SessionRegistry(sdk_factory)
+    registry = SessionRegistry(sdk_factory, metadata_store=metadata_store)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -150,7 +156,7 @@ def create_app(
 
     @app.get("/sessions/{session_id}/stream", dependencies=[Depends(auth_dep)])
     async def stream(session_id: str, request: Request) -> StreamingResponse:
-        s = registry.get(session_id)
+        s = await registry.get_or_resume(session_id)
         if s is None:
             raise HTTPException(status_code=404, detail="Session not found")
         last_event_id = request.headers.get("last-event-id")
@@ -163,6 +169,14 @@ def create_app(
             # silent fallback would replay the entire stream and produce duplicate events
             # in clients that thought they were resuming.
             raise HTTPException(status_code=400, detail="Last-Event-ID must be a non-negative integer")
+
+        # Resume edge case: the session was rebuilt from metadata, so the new
+        # event_log starts at seq 1. A client reconnecting with `Last-Event-Id`
+        # from the old log would point past our current max — clamp it so the
+        # subscription doesn't sit there forever waiting for events with
+        # impossibly-large seq numbers.
+        if after_seq > s.event_log.last_seq:
+            after_seq = 0
 
         # Pre-flight: if the cursor is evicted, return 412 before opening the stream.
         if after_seq:
@@ -212,7 +226,7 @@ def create_app(
 
     @app.post("/sessions/{session_id}/input", dependencies=[Depends(auth_dep)])
     async def input_message(session_id: str, request: Request) -> Response:
-        s = registry.get(session_id)
+        s = await registry.get_or_resume(session_id)
         if s is None:
             raise HTTPException(status_code=404, detail="Session not found")
         try:
