@@ -318,15 +318,46 @@ async def translate_sdk_messages(messages: Any, emit: Callable[[str, dict[str, A
             emit("error", {"code": "translate_failed", "message": str(e)})
 
 
+# SDK content-block dataclasses encode their type via the Python class itself
+# (TextBlock, ToolUseBlock, ...) and do NOT carry a `type` attribute. The wire
+# protocol — and every client — expects an explicit `type`, so we recover it
+# from the class name on the way out. Class-name lookup (rather than isinstance
+# against the imported SDK) keeps this working when fixtures use look-alike
+# fakes whose classes mirror the SDK names but aren't subclasses.
+_BLOCK_TYPE_BY_CLASS_NAME: dict[str, str] = {
+    "TextBlock": "text",
+    "ThinkingBlock": "thinking",
+    "ToolUseBlock": "tool_use",
+    "ToolResultBlock": "tool_result",
+    "ServerToolUseBlock": "server_tool_use",
+    "ServerToolResultBlock": "server_tool_result",
+}
+
+
 def _serialize_blocks(blocks: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for b in blocks or []:
         if isinstance(b, dict):
             out.append(b)
             continue
-        # Try to coerce SDK block dataclasses → dicts
-        d: dict[str, Any] = {}  # pragma: no cover - exercised only when real SDK passes dataclass blocks
-        for attr in ("type", "text", "id", "name", "input", "source", "tool_use_id", "content", "is_error"):
+        # Coerce SDK block dataclasses → dicts.
+        d: dict[str, Any] = {}
+        inferred_type = _BLOCK_TYPE_BY_CLASS_NAME.get(type(b).__name__)
+        if inferred_type is not None:
+            d["type"] = inferred_type
+        for attr in (
+            "type",
+            "text",
+            "thinking",
+            "signature",
+            "id",
+            "name",
+            "input",
+            "source",
+            "tool_use_id",
+            "content",
+            "is_error",
+        ):
             v = getattr(b, attr, None)
             if v is not None:
                 d[attr] = v
