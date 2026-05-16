@@ -123,6 +123,13 @@ export interface CreateSessionOptions {
   model?: string;
   permission_mode?: string;
   cwd?: string;
+  /**
+   * Ask the server to enable SDK partial-message streaming. When true, the
+   * stream carries `message_delta` events with text deltas (and
+   * `input_json_delta` chunks for tool inputs) before the final
+   * `message_complete`. Default false.
+   */
+  include_partial_messages?: boolean;
 }
 
 export interface CreateSessionResponse {
