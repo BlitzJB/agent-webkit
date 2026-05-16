@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
   createAgentClient,
+  TransportError,
   type AgentClient,
   type ApproveOptions,
   type CreateSessionOptions,
@@ -35,6 +36,27 @@ export interface UseAgentSessionOptions {
    * without forking the connection.
    */
   onEvent?: (event: DeliveredEvent) => void;
+  /**
+   * When the stream fails because the server-side session is gone (404) or
+   * its ring buffer evicted our cursor (412), silently create a new session
+   * and continue. Only applies when the caller did NOT pass `sessionId`
+   * (attached sessions are caller-owned). Defaults to true.
+   */
+  autoRecover?: boolean;
+  /**
+   * How many recovery attempts to make per loss before giving up and
+   * surfacing a `stream_error`. Defaults to 5.
+   */
+  maxRecoveryAttempts?: number;
+}
+
+// HTTP statuses where the right move is to throw away the current sessionId
+// and create a fresh one. 404 = session reaped server-side; 412 = ring-buffer
+// evicted our Last-Event-ID and we can't resume.
+const RECOVERABLE_STATUSES: ReadonlySet<number> = new Set([404, 412]);
+
+function isRecoverableTransportError(err: unknown): boolean {
+  return err instanceof TransportError && err.status !== undefined && RECOVERABLE_STATUSES.has(err.status);
 }
 
 export interface UseAgentSessionReturn extends AgentState {
@@ -64,7 +86,15 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
   const closedRef = useRef(false);
 
   // We deliberately re-key on baseUrl/sessionId/token, not the whole opts object.
-  const { baseUrl, token, sessionId: attachSessionId, resumeFromEventId, autoStart = true } = opts;
+  const {
+    baseUrl,
+    token,
+    sessionId: attachSessionId,
+    resumeFromEventId,
+    autoStart = true,
+    autoRecover = true,
+    maxRecoveryAttempts = 5,
+  } = opts;
   const createOpts = opts.create;
   const injectedClient = opts.client;
   const onEventRef = useRef(opts.onEvent);
@@ -79,50 +109,86 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
     const client = injectedClient ?? createAgentClient(clientOpts);
 
     let aborted = false;
+    let recoveryAttempts = 0;
+
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    const emitError = (code: string, message: string): void => {
+      dispatch({
+        type: "server_event",
+        event: { id: -1, event: "error", data: { code, message } },
+      });
+    };
 
     (async () => {
-      let session: Session;
-      if (attachSessionId) {
-        const attachOpts = resumeFromEventId !== undefined ? { resumeFromEventId } : {};
-        session = client.attachSession(attachSessionId, attachOpts) as Session;
-      } else {
-        session = await client.createSession(createOpts);
-      }
-      if (aborted) {
-        // StrictMode raced us — abort the local stream but leave the server session alive.
-        // Cleanup happens via reaper / explicit close().
-        session.detach();
-        return;
-      }
-      sessionRef.current = session;
-      setSessionId(session.id);
-
-      try {
-        for await (const ev of session.events()) {
-          if (aborted) break;
-          const tap = onEventRef.current;
-          if (tap) {
-            try {
-              tap(ev);
-            } catch {
-              /* taps must not break the reducer pipeline */
-            }
+      // Outer loop: recreate session on recoverable failures (404/412). Inner
+      // try/catch handles per-stream errors; we either break (fatal / aborted /
+      // attached-session loss) or `continue` (transparent recreate).
+      while (!aborted) {
+        let session: Session;
+        try {
+          if (attachSessionId) {
+            const attachOpts = resumeFromEventId !== undefined ? { resumeFromEventId } : {};
+            session = client.attachSession(attachSessionId, attachOpts) as Session;
+          } else {
+            session = await client.createSession(createOpts);
           }
-          dispatch({ type: "server_event", event: ev });
+        } catch (err) {
+          if (!aborted) {
+            emitError(
+              "stream_error",
+              err instanceof Error ? err.message : String(err)
+            );
+          }
+          return;
         }
-      } catch (err) {
-        if (!aborted) {
-          dispatch({
-            type: "server_event",
-            event: {
-              id: -1,
-              event: "error",
-              data: {
-                code: "stream_error",
-                message: err instanceof Error ? err.message : String(err),
-              },
-            },
-          });
+
+        if (aborted) {
+          // StrictMode raced us — abort the local stream but leave the server
+          // session alive. Cleanup happens via reaper / explicit close().
+          session.detach();
+          return;
+        }
+        sessionRef.current = session;
+        setSessionId(session.id);
+
+        try {
+          for await (const ev of session.events()) {
+            if (aborted) break;
+            const tap = onEventRef.current;
+            if (tap) {
+              try {
+                tap(ev);
+              } catch {
+                /* taps must not break the reducer pipeline */
+              }
+            }
+            dispatch({ type: "server_event", event: ev });
+          }
+          // Stream ended cleanly (server emitted `done`). Don't recreate.
+          return;
+        } catch (err) {
+          if (aborted) return;
+          // Decide: silent recovery, or surface the error.
+          const recoverable =
+            autoRecover &&
+            !attachSessionId &&
+            isRecoverableTransportError(err) &&
+            recoveryAttempts < maxRecoveryAttempts;
+
+          if (!recoverable) {
+            emitError(
+              "stream_error",
+              err instanceof Error ? err.message : String(err)
+            );
+            return;
+          }
+
+          // Backoff with light jitter, then loop to create a new session.
+          recoveryAttempts += 1;
+          const backoff = Math.min(250 * 2 ** (recoveryAttempts - 1), 4000);
+          await sleep(backoff + Math.random() * 100);
+          // Continue the while-loop: fresh createSession + events().
         }
       }
     })();
@@ -132,16 +198,16 @@ export function useAgentSession(opts: UseAgentSessionOptions): UseAgentSessionRe
       closedRef.current = true;
       const s = sessionRef.current;
       if (s) {
-        // Detach only — do NOT delete the server-side session here. StrictMode double-
-        // invokes effects, and remounts/HMR would otherwise destroy a session that the
-        // user expects to outlive the component lifecycle. Permanent teardown is the
-        // caller's responsibility via `close()`.
+        // Detach only — do NOT delete the server-side session here. StrictMode
+        // double-invokes effects, and remounts/HMR would otherwise destroy a
+        // session that the user expects to outlive the component lifecycle.
+        // Permanent teardown is the caller's responsibility via `close()`.
         s.detach();
       }
       sessionRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [baseUrl, token, attachSessionId, autoStart, injectedClient]);
+  }, [baseUrl, token, attachSessionId, autoStart, autoRecover, maxRecoveryAttempts, injectedClient]);
 
   const requireSession = (): Session => {
     const s = sessionRef.current;
