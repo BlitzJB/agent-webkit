@@ -52,7 +52,18 @@ def _make_real_sdk_factory(  # pragma: no cover - requires real claude_agent_sdk
 
             local_can_use_tool = wrap_can_use_tool_for_genui(can_use_tool, genui)
 
-        options_kwargs: dict[str, Any] = {"can_use_tool": local_can_use_tool}
+        # Launch the CLI with --dangerously-skip-permissions so runtime
+        # switching INTO bypassPermissions via set_permission_mode works.
+        # The flag is a launch-time GATE (not an auto-bypass): without it,
+        # the CLI rejects "Cannot set permission mode to bypassPermissions
+        # because the session was not launched with --dangerously-skip-
+        # permissions". With it, the session still starts in whatever
+        # permission_mode the caller configured; bypass is purely opt-in
+        # via a later set_permission_mode call.
+        options_kwargs: dict[str, Any] = {
+            "can_use_tool": local_can_use_tool,
+            "extra_args": {"dangerously-skip-permissions": None},
+        }
         if config.model:
             options_kwargs["model"] = config.model
         if config.permission_mode:
@@ -359,7 +370,16 @@ def create_app(
             elif msg_type == "question_response":
                 s.resolve_question(body["correlation_id"], body["answers"])
             elif msg_type == "set_permission_mode":
-                await s.set_permission_mode(body["mode"])
+                try:
+                    await s.set_permission_mode(body["mode"])
+                except Exception as e:
+                    # The SDK / CLI may refuse a mode switch for safety
+                    # reasons (e.g. switching to bypassPermissions on a
+                    # session that wasn't launched with the corresponding
+                    # flag). Surface those as 400 with the SDK's message
+                    # so the UI can show a meaningful notice instead of
+                    # an opaque 500.
+                    raise HTTPException(status_code=400, detail=f"set_permission_mode failed: {e}")
             elif msg_type == "set_model":
                 await s.set_model(body.get("model"))
             elif msg_type == "stop_task":
@@ -379,6 +399,11 @@ def create_app(
         except KeyError as e:
             raise HTTPException(status_code=400, detail=f"Missing field: {e.args[0]}")
         return Response(status_code=204)
+
+    # Expose the registry on app.state so apps mounting on top of this FastAPI
+    # instance can subscribe to the global event log, query session state, etc.
+    # without needing to fork create_app. Not part of the wire protocol.
+    app.state.registry = registry
 
     return app
 

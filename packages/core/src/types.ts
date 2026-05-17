@@ -85,6 +85,7 @@ export type ServerEvent =
     }
   | { event: "error"; data: { code: string; message: string } }
   | { event: "mcp_status_change"; data: { server_name: string; status: string } }
+  | { event: "permission_mode_changed"; data: { mode: string } }
   | { event: "done"; data: Record<string, never> };
 
 export type ServerEventName = ServerEvent["event"];

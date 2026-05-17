@@ -56,6 +56,10 @@ export interface SessionState {
   /** Transient user-visible message — e.g. "another tab already answered".
    *  The UI should render it as a soft banner and clear it on its own. */
   notice: { code: string; message: string; ts: number } | null;
+  /** Current SDK permission_mode. Null until the first
+   *  permission_mode_changed event arrives — callers can fall back to the
+   *  session metadata's permission_mode for the initial display. */
+  permissionMode: string | null;
 }
 
 /** Top-level mux state — many sessions, keyed by id. */
@@ -73,6 +77,7 @@ export const initialSessionState: SessionState = {
   lastError: null,
   totalCostUsd: 0,
   notice: null,
+  permissionMode: null,
 };
 
 export const initialMuxState: MuxState = {
@@ -253,6 +258,12 @@ function reduceSession(s: SessionState, event: string, data: any, seqId: number)
 
     case "mcp_status_change":
       return s;
+
+    case "permission_mode_changed": {
+      const mode = typeof data?.mode === "string" ? data.mode : null;
+      if (mode === null || mode === s.permissionMode) return s;
+      return { ...s, permissionMode: mode };
+    }
 
     case "done":
       return { ...s, status: "idle" };

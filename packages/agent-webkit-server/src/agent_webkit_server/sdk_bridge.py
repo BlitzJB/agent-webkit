@@ -94,7 +94,11 @@ class ConflictError(Exception):
     """Raised when a permission/question response targets an already-resolved correlation_id."""
 
 
-def build_can_use_tool(emit: Callable[[str, dict[str, Any]], None], router: PermissionRouter):
+def build_can_use_tool(
+    emit: Callable[[str, dict[str, Any]], None],
+    router: PermissionRouter,
+    on_exit_plan_approved: Callable[[], "asyncio.Future[Any] | Any"] | None = None,
+):
     """Construct a `can_use_tool` callback for the SDK.
 
     `emit(event_name, data)` appends a server event to the log (we lazily import the SDK
@@ -146,16 +150,43 @@ def build_can_use_tool(emit: Callable[[str, dict[str, Any]], None], router: Perm
                 kwargs["updated_permissions"] = [
                     _hydrate_permission_update(p) for p in decision["updated_permissions"]
                 ]
+            # ExitPlanMode special-case: the SDK auto-flips itself to
+            # "default" on approval, but the user was likely in
+            # acceptEdits/bypassPermissions before entering plan. Fire a
+            # post-approval task to restore the pre-plan mode. Scheduled
+            # (not awaited) so we don't block our own return — the SDK
+            # processes our allow first, then our restore.
+            if tool_name == "ExitPlanMode" and on_exit_plan_approved is not None:
+                asyncio.create_task(_run_post_exit_plan(on_exit_plan_approved))
             return PermissionResultAllow(**kwargs)
         else:
-            kwargs2: dict[str, Any] = {}
-            if decision.get("message") is not None:
-                kwargs2["message"] = decision["message"]
+            # Claude's API rejects a tool_result with is_error=true and
+            # empty content (HTTP 400). The SDK forwards our `message`
+            # into that content, so we MUST provide a non-empty default
+            # when the client didn't send one — otherwise an empty deny
+            # nukes the next turn.
+            message = decision.get("message")
+            if not isinstance(message, str) or not message.strip():
+                message = "Denied by user."
+            kwargs2: dict[str, Any] = {"message": message}
             if decision.get("interrupt") is not None:
                 kwargs2["interrupt"] = decision["interrupt"]
             return PermissionResultDeny(**kwargs2)
 
     return can_use_tool
+
+
+async def _run_post_exit_plan(cb: Callable[[], "asyncio.Future[Any] | Any"]) -> None:
+    # Yield once so our PermissionResultAllow gets returned and the SDK
+    # has a chance to apply its internal "exit plan → default" switch
+    # before we attempt to restore the pre-plan mode on top of it.
+    await asyncio.sleep(0)
+    try:
+        result = cb()
+        if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+            await result
+    except Exception:
+        logger.exception("ExitPlanMode post-approval callback failed")
 
 
 def _coerce_context(ctx: Any) -> dict[str, Any]:

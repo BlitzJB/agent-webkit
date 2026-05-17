@@ -70,6 +70,7 @@ class Session:
         router: Optional[PermissionRouter] = None,
         idle_timeout_s: float = 300.0,
         on_sdk_session_id_change: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_permission_mode_change: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> None:
         self.id = session_id
         # Client is spawned lazily on the first interaction (submit_user_message,
@@ -98,6 +99,17 @@ class Session:
         # process restarts via ClaudeAgentOptions(resume=sdk_session_id).
         self.sdk_session_id: Optional[str] = None
         self._on_sdk_session_id_change = on_sdk_session_id_change
+        self._on_permission_mode_change = on_permission_mode_change
+        # Tracks the SDK's currently-active permission mode. Updated whenever
+        # set_permission_mode is called. Surfaced via the wire event so
+        # subscribers (and other tabs) can react.
+        self.permission_mode: Optional[str] = None
+        # Mode the user was in before entering "plan". Captured on the
+        # transition INTO plan mode; restored automatically after an
+        # ExitPlanMode tool is approved. The SDK auto-switches to "default"
+        # on plan exit, which loses the user's prior choice (e.g. they were
+        # in "acceptEdits"). This restores it.
+        self._pre_plan_mode: Optional[str] = None
         self._inbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
         self._tasks: list[asyncio.Task[Any]] = []
         self._closed = False
@@ -281,7 +293,21 @@ class Session:
 
     async def set_permission_mode(self, mode: str) -> None:
         await self.ensure_started()
+        # Capture pre-plan mode on the transition INTO plan so we can
+        # restore it after the agent's ExitPlanMode is approved. If we're
+        # already in plan, don't overwrite the captured prior.
+        if mode == "plan" and self.permission_mode != "plan":
+            self._pre_plan_mode = self.permission_mode or "default"
         await self.client.set_permission_mode(mode)
+        self.permission_mode = mode
+        # Emit AFTER the SDK has acknowledged the mode switch so subscribers
+        # see the event only when it's authoritative.
+        self._emit("permission_mode_changed", {"mode": mode})
+        if self._on_permission_mode_change is not None:
+            try:
+                await self._on_permission_mode_change(mode)
+            except Exception:
+                logger.exception("on_permission_mode_change callback failed for %s", self.id)
         self.touch()
 
     async def set_model(self, model: Optional[str]) -> None:
@@ -393,7 +419,26 @@ class SessionRegistry:
         def emit_with_session_id(event: str, data: dict[str, Any]) -> None:
             self.event_log.append(session_id, event, data)
 
-        can_use_tool = build_can_use_tool(emit_with_session_id, router)
+        # Late-bound reference to the Session so the post-approval callback
+        # can call back into it. Filled in after construction below.
+        session_ref: dict[str, "Session"] = {}
+
+        async def _on_exit_plan_approved() -> None:
+            s = session_ref.get("self")
+            if s is None:
+                return
+            prior = s._pre_plan_mode
+            if not prior:
+                return
+            s._pre_plan_mode = None
+            try:
+                await s.set_permission_mode(prior)
+            except Exception:
+                logger.exception("Failed to restore pre-plan mode for %s", session_id)
+
+        can_use_tool = build_can_use_tool(
+            emit_with_session_id, router, on_exit_plan_approved=_on_exit_plan_approved
+        )
 
         async def _spawn() -> SDKClient:
             return await self._invoke_factory(config, can_use_tool)
@@ -416,6 +461,32 @@ class SessionRegistry:
             except Exception:  # pragma: no cover - defensive
                 logger.exception("Failed to persist session metadata for %s", session_id)
 
+        async def _on_mode(mode: str) -> None:
+            # Mutate config so future _on_sdk_id snapshots (and any later resume)
+            # carry the latest mode.
+            config.permission_mode = mode
+            if self._metadata_store is None:
+                return
+            try:
+                existing = await self._metadata_store.load(session_id)
+                # If we never captured the sdk_session_id yet, there's nothing
+                # in the store yet — the first _on_sdk_id will persist it with
+                # the right mode (we just mutated config).
+                if existing is None:
+                    return
+                await self._metadata_store.save(SessionMetadata(
+                    id=existing.id,
+                    sdk_session_id=existing.sdk_session_id,
+                    model=existing.model,
+                    permission_mode=mode,
+                    cwd=existing.cwd,
+                    include_partial_messages=existing.include_partial_messages,
+                    created_at=existing.created_at,
+                    last_seen_at=existing.last_seen_at,
+                ))
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("Failed to persist permission_mode for %s", session_id)
+
         session = Session(
             session_id,
             spawn_client=_spawn,
@@ -423,7 +494,12 @@ class SessionRegistry:
             router=router,
             idle_timeout_s=self._idle_timeout_s,
             on_sdk_session_id_change=_on_sdk_id if self._metadata_store is not None else None,
+            on_permission_mode_change=_on_mode,
         )
+        # Seed the initial mode so the in-memory Session has the right value
+        # before the first set_permission_mode call (used for header pills etc.).
+        session.permission_mode = config.permission_mode
+        session_ref["self"] = session
         # Emit session_ready synchronously so attaching SSE subscribers see it
         # immediately (no waiting on SDK spawn). The first real interaction
         # will trigger ensure_started() and spawn the SDK.
