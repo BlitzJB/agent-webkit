@@ -189,23 +189,43 @@ export function useAgentMux(opts: UseAgentMuxOptions): AgentMux {
     [client]
   );
   const interrupt = useCallback((sid: string) => client.interrupt(sid), [client]);
+  // A 409 from /input on permission/question responses means "first-reply
+  // already won" — typically because we (or another tab) already answered
+  // this correlation_id. Treat it as benign success and still dispatch the
+  // resolved action so the UI clears, instead of leaving the modal stuck
+  // with an opaque "Conflict" error.
+  const isAlreadyAnswered = (err: unknown): boolean =>
+    err instanceof TransportError && err.status === 409;
+
   const approve = useCallback(
     async (sid: string, correlationId: string, options?: ApproveOptions): Promise<void> => {
-      await client.approve(sid, correlationId, options);
+      try {
+        await client.approve(sid, correlationId, options);
+      } catch (err) {
+        if (!isAlreadyAnswered(err)) throw err;
+      }
       dispatch({ type: "permission_resolved", sessionId: sid, correlationId });
     },
     [client]
   );
   const deny = useCallback(
     async (sid: string, correlationId: string, options?: DenyOptions): Promise<void> => {
-      await client.deny(sid, correlationId, options);
+      try {
+        await client.deny(sid, correlationId, options);
+      } catch (err) {
+        if (!isAlreadyAnswered(err)) throw err;
+      }
       dispatch({ type: "permission_resolved", sessionId: sid, correlationId });
     },
     [client]
   );
   const answer = useCallback(
     async (sid: string, correlationId: string, answers: unknown): Promise<void> => {
-      await client.answer(sid, correlationId, answers);
+      try {
+        await client.answer(sid, correlationId, answers);
+      } catch (err) {
+        if (!isAlreadyAnswered(err)) throw err;
+      }
       dispatch({ type: "question_resolved", sessionId: sid, correlationId });
     },
     [client]
