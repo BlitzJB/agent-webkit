@@ -125,11 +125,23 @@ async def test_session_survives_process_restart_via_metadata_store(tmp_path) -> 
                 stop_at="session_ready",
                 timeout=10.0,
             )
+            # Sanity: just attaching to view the transcript must NOT have
+            # spawned a new SDK subprocess (lazy spawn). Triggering an
+            # interaction does — and the factory then receives the resume id.
+            assert captured_v2 == [], "view-only attach must not invoke factory"
+            await c.post(
+                f"/sessions/{sid}/input",
+                json={"type": "user_message", "content": "ping"},
+            )
+            # Drain through result so the factory call has fully landed.
+            await _read_sse_events(
+                c, f"/sessions/{sid}/stream", stop_at="result", timeout=10.0
+            )
 
     # Stream connected successfully — no 404.
     assert any(e["event"] == "session_ready" for e in events_after)
 
-    # The fresh process's factory was called once, *with* the resume id.
+    # Now the factory has been called — exactly once, with the resume id.
     assert len(captured_v2) == 1
     rebuild_cfg = captured_v2[0]
     assert rebuild_cfg.resume == "fake-1", (

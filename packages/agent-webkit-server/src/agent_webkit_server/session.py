@@ -57,15 +57,29 @@ class Session:
     def __init__(
         self,
         session_id: str,
-        client: SDKClient,
+        client: Optional[SDKClient] = None,
         *,
+        spawn_client: Optional[Callable[[], Awaitable[SDKClient]]] = None,
         event_log: Optional[EventLog] = None,
         router: Optional[PermissionRouter] = None,
         idle_timeout_s: float = 300.0,
         on_sdk_session_id_change: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> None:
         self.id = session_id
-        self.client = client
+        # Client is spawned lazily on the first interaction (submit_user_message,
+        # interrupt, etc.). View-only attachers — switching to a session just to
+        # read its transcript — never trigger the spawn, so cold session
+        # switches return instantly instead of waiting on a multi-second SDK
+        # subprocess boot.
+        #
+        # If a client is passed directly (legacy / test path), it's installed
+        # immediately and the lazy spawn is bypassed.
+        if client is None and spawn_client is None:
+            raise ValueError("Session requires either `client` or `spawn_client`")
+        self.client: Optional[SDKClient] = client
+        self._spawn_client = spawn_client
+        self._start_lock: asyncio.Lock = asyncio.Lock()
+        self._started: bool = client is not None
         self.event_log = event_log if event_log is not None else EventLog()
         self.router = router if router is not None else PermissionRouter()
         self.idle_timeout_s = idle_timeout_s
@@ -92,20 +106,44 @@ class Session:
     def idle_for(self) -> float:
         return time.monotonic() - self._last_activity
 
-    async def start(self) -> None:
-        # Emit session_ready first so subscribers see it before anything else.
+    def emit_ready(self) -> None:
+        """Emit session_ready into the event log. Called by the registry at
+        shell-construction time so attaching SSE subscribers see the protocol
+        handshake immediately, without waiting for SDK spawn."""
         self.event_log.append("session_ready", {
             "session_id": self.id,
             "protocol_version": PROTOCOL_VERSION,
         })
 
-        # Start the receive-side translator pulling from the SDK.
-        self._tasks.append(asyncio.create_task(
-            self._run_receive_loop(), name=f"session-{self.id}-recv"
-        ))
-        self._tasks.append(asyncio.create_task(
-            self._run_send_loop(), name=f"session-{self.id}-send"
-        ))
+    async def ensure_started(self) -> None:
+        """Idempotent: spawn the SDK client and wire up receive/send loops
+        on the first call; subsequent calls are no-ops.
+
+        This is what makes lazy-spawn work: get_or_resume returns a shell
+        synchronously, and only the first inbound action (submit_user_message,
+        interrupt, etc.) actually boots the SDK subprocess.
+        """
+        if self._started and self._tasks:
+            return
+        async with self._start_lock:
+            if self._started and self._tasks:
+                return
+            if self.client is None:
+                if self._spawn_client is None:  # pragma: no cover - guarded in __init__
+                    raise RuntimeError("Session has no spawn_client and no client")
+                self.client = await self._spawn_client()
+            self._tasks.append(asyncio.create_task(
+                self._run_receive_loop(), name=f"session-{self.id}-recv"
+            ))
+            self._tasks.append(asyncio.create_task(
+                self._run_send_loop(), name=f"session-{self.id}-send"
+            ))
+            self._started = True
+
+    # Backwards-compat alias so any existing caller of start() still works.
+    async def start(self) -> None:
+        self.emit_ready()
+        await self.ensure_started()
 
     async def _run_receive_loop(self) -> None:
         def emit(event: str, data: dict[str, Any]) -> None:
@@ -170,6 +208,10 @@ class Session:
     # --- Inbound dispatch (called by HTTP endpoint) ---
 
     async def submit_user_message(self, content: Any) -> None:
+        # Lazy-spawn: first interaction with a cold/resumed session is what
+        # triggers the SDK subprocess boot. View-only attachers never pay
+        # this cost.
+        await self.ensure_started()
         # Record the user turn in the event log BEFORE handing it to the SDK
         # so anyone reconnecting/attaching mid-conversation replays the full
         # transcript — assistant turns alone would look like the agent
@@ -187,6 +229,7 @@ class Session:
         self.touch()
 
     async def interrupt(self) -> None:
+        await self.ensure_started()
         await self.client.interrupt()
         self.touch()
 
@@ -218,14 +261,17 @@ class Session:
         self.touch()
 
     async def set_permission_mode(self, mode: str) -> None:
+        await self.ensure_started()
         await self.client.set_permission_mode(mode)
         self.touch()
 
     async def set_model(self, model: Optional[str]) -> None:
+        await self.ensure_started()
         await self.client.set_model(model)
         self.touch()
 
     async def stop_task(self, task_id: str) -> None:
+        await self.ensure_started()
         await self.client.stop_task(task_id)
         self.touch()
 
@@ -243,10 +289,11 @@ class Session:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        try:
-            await self.client.disconnect()
-        except Exception:
-            logger.exception("client.disconnect failed")
+        if self.client is not None:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                logger.exception("client.disconnect failed")
         self.event_log.append("done", {})
         self.event_log.close()
 
@@ -304,9 +351,13 @@ class SessionRegistry:
         return session
 
     async def _build_session(self, session_id: str, config: SessionConfig) -> Session:
-        # Build the per-session router and event log up front so the can_use_tool callback
-        # can be constructed before the SDK client. Factories receive the callback and are
-        # expected to install it via their own constructor (e.g. ClaudeAgentOptions.can_use_tool).
+        # Build the per-session router and event log up front so the can_use_tool
+        # callback can be constructed before the SDK client. The factory is
+        # deferred — wrapped in a closure passed as `spawn_client` — so that
+        # cold session resumes return a ready-to-stream shell without paying
+        # the multi-second SDK subprocess spawn. The first interaction
+        # (submit_user_message, interrupt, etc.) triggers the actual spawn
+        # via Session.ensure_started().
         seed: Optional[list[LoggedEvent]] = None
         if config.resume:
             # Hydrate the in-memory ring from the SDK's authoritative on-disk
@@ -320,7 +371,9 @@ class SessionRegistry:
         event_log = EventLog(seed=seed)
         router = PermissionRouter()
         can_use_tool = build_can_use_tool(event_log.append, router)
-        client = await self._invoke_factory(config, can_use_tool)
+
+        async def _spawn() -> SDKClient:
+            return await self._invoke_factory(config, can_use_tool)
 
         # When the SDK reveals its native session id (in the first ResultMessage),
         # update metadata so subsequent restarts can resume. Closes over (session_id,
@@ -342,13 +395,16 @@ class SessionRegistry:
 
         session = Session(
             session_id,
-            client,
+            spawn_client=_spawn,
             event_log=event_log,
             router=router,
             idle_timeout_s=self._idle_timeout_s,
             on_sdk_session_id_change=_on_sdk_id if self._metadata_store is not None else None,
         )
-        await session.start()
+        # Emit session_ready synchronously so attaching SSE subscribers see it
+        # immediately (no waiting on SDK spawn). The first real interaction
+        # will trigger ensure_started() and spawn the SDK.
+        session.emit_ready()
         return session
 
     async def _invoke_factory(self, config: SessionConfig, can_use_tool: Any) -> SDKClient:

@@ -217,5 +217,7 @@ async def test_attach_after_restart_seeds_eventlog_from_sdk_transcript(tmp_path,
     complete_evt = next(e for e in events if e["event"] == "message_complete")
     assert json.loads(complete_evt["data"])["message"]["content"] == [{"type": "text", "text": "4"}]
 
-    # And the factory got resume=<sdk-historic-1>.
-    assert captured[0].resume == "sdk-historic-1"
+    # Lazy spawn: view-only attach doesn't invoke the factory. Transcript
+    # replay alone, served straight from the seeded EventLog, is enough to
+    # populate the chat — no SDK subprocess needed until the user sends.
+    assert captured == []

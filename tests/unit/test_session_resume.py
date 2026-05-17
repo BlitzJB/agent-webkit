@@ -112,13 +112,16 @@ async def test_get_or_resume_rebuilds_lost_session_with_resume_flag(tmp_path) ->
     await registry.remove(sid, purge_metadata=False)
     assert registry.get(sid) is None
 
-    # Phase 3: rebuild.
+    # Phase 3: rebuild (returns a shell — no factory call yet thanks to lazy spawn).
     s2 = await registry.get_or_resume(sid)
     assert s2 is not None
     assert s2.id == sid  # same wrapper UUID — clients don't have to know
+    assert len(captured) == 1, "resume must NOT spawn a new SDK subprocess; lazy"
 
-    # Factory was called twice; the second call carried resume=<sdk_session_id>
-    # plus the original config fields.
+    # The first real interaction is what fires the spawn. After that the
+    # factory has been called twice and the second call must carry the
+    # original config plus resume=<sdk_session_id>.
+    await s2.ensure_started()
     assert len(captured) == 2
     rebuild_cfg = captured[1]
     assert rebuild_cfg.resume == "fake-1"
@@ -162,7 +165,11 @@ async def test_metadata_without_sdk_session_id_starts_fresh_under_same_wrapper(t
     s = await registry.get_or_resume(sid)
     assert s is not None
     assert s.id == sid
-    # Factory was invoked with the original config and resume=None (fresh start).
+    # Lazy spawn: get_or_resume does NOT invoke the factory; the first real
+    # interaction does. Once we trigger ensure_started, the factory runs
+    # with the original config and resume=None (fresh start, no transcript).
+    assert captured == []
+    await s.ensure_started()
     assert len(captured) == 1
     assert captured[0].resume is None
     assert captured[0].cwd == "/work/x"
