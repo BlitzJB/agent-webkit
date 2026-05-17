@@ -236,14 +236,39 @@ def create_app(
             # Instead we ensure_future the iterator step and *poll* it with
             # asyncio.wait so the task itself is never cancelled — we just
             # observe whether it's done yet.
+            # Three things to race per loop:
+            #   • the next event from the global log (polled — wait_for
+            #     would cancel the iterator, see comment above)
+            #   • a 2s keepalive timeout (idle intermediaries)
+            #   • the ASGI http.disconnect message (browser aborted)
+            # The disconnect race is what makes the slot release IMMEDIATELY
+            # on client abort. Without it, the server waits up to 2s for the
+            # next keepalive write to break-pipe — during HMR / rapid mount
+            # churn that pile-up queues subsequent requests behind zombie
+            # streams on the per-origin connection slot limit.
             keepalive_interval = 2.0
             pending_task: Optional[asyncio.Task[Any]] = None
+            disconnect_task: Optional[asyncio.Task[Any]] = None
+
+            async def _wait_for_disconnect() -> None:
+                while True:
+                    msg = await request.receive()
+                    if msg.get("type") == "http.disconnect":
+                        return
+
             try:
+                disconnect_task = asyncio.ensure_future(_wait_for_disconnect())
                 sub = registry.event_log.subscribe(after_seq).__aiter__()
                 while True:
                     if pending_task is None:
                         pending_task = asyncio.ensure_future(sub.__anext__())
-                    done, _ = await asyncio.wait({pending_task}, timeout=keepalive_interval)
+                    done, _ = await asyncio.wait(
+                        {pending_task, disconnect_task},
+                        timeout=keepalive_interval,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if disconnect_task in done:
+                        return
                     if not done:
                         yield b": keepalive\n\n"
                         continue
@@ -263,10 +288,9 @@ def create_app(
                 msg = json.dumps({"code": "evicted", "message": str(e)})
                 yield f"event: error\ndata: {msg}\n\n".encode("utf-8")
             finally:
-                # If the response is torn down mid-flight, cancel the
-                # outstanding task so we don't leak it.
-                if pending_task is not None and not pending_task.done():
-                    pending_task.cancel()
+                for t in (pending_task, disconnect_task):
+                    if t is not None and not t.done():
+                        t.cancel()
 
         headers = {
             "cache-control": "no-cache",
