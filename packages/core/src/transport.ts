@@ -45,6 +45,18 @@ export class Transport {
     return (await res.json()) as T;
   }
 
+  async getJSON<T>(path: string): Promise<T> {
+    const res = await this.fetchImpl(this.baseUrl + path, {
+      method: "GET",
+      headers: this.headers(),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new TransportError(`GET ${path} failed: ${res.status}`, res.status, text);
+    }
+    return (await res.json()) as T;
+  }
+
   async delete(path: string): Promise<void> {
     const res = await this.fetchImpl(this.baseUrl + path, {
       method: "DELETE",

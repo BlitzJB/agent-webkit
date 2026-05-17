@@ -128,15 +128,18 @@ async def test_permission_response_race_yields_exactly_one_204_rest_409():
 
             # Drain SSE up to the permission_request event so we know the router is armed.
             cid: str | None = None
-            async with c.stream("GET", f"/sessions/{sid}/stream") as r:
+            async with c.stream("GET", "/stream") as r:
                 buf: list[str] = []
                 event_name: str | None = None
                 async for line in r.aiter_lines():
                     if line == "":
                         if event_name == "permission_request":
                             import json
-                            data = json.loads("\n".join(buf))
-                            cid = data["correlation_id"]
+                            # /stream now ships multiplex envelopes:
+                            # {"session_id": "...", "payload": {...}}
+                            envelope = json.loads("\n".join(buf))
+                            payload = envelope.get("payload", envelope)
+                            cid = payload["correlation_id"]
                             break
                         buf, event_name = [], None
                         continue

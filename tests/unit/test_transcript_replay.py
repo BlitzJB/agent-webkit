@@ -161,14 +161,13 @@ def _factory(captured: list[SessionConfig]):
 
 
 @pytest.mark.asyncio
-async def test_attach_after_restart_seeds_eventlog_from_sdk_transcript(tmp_path, monkeypatch) -> None:
-    """Full pipeline: simulated restart, attaching to the old session id gets
-    the prior transcript back — sourced from a stubbed SDK reader, not from
-    any duplicate journal we keep."""
+async def test_history_endpoint_returns_translated_transcript(tmp_path, monkeypatch) -> None:
+    """Full pipeline (new multiplex model): GET /sessions/{id}/history returns
+    the prior conversation translated to wire-event shape — sourced from a
+    stubbed SDK reader. The /stream endpoint stays a pure observer of future
+    events; past events come from history."""
     metadata_dir = tmp_path / "sessions"
 
-    # Phase 1: a session existed previously; pre-seed the metadata file as if
-    # it had completed a turn and captured an SDK session id.
     sid = "12345678-1234-1234-1234-123456789012"
     store_v1 = FileSessionMetadataStore(metadata_dir)
     await store_v1.save(SessionMetadata(
@@ -177,7 +176,6 @@ async def test_attach_after_restart_seeds_eventlog_from_sdk_transcript(tmp_path,
         cwd="/work/repo",
     ))
 
-    # Stub the SDK transcript reader to return a canned history.
     historic = [
         _StubSessionMessage("user", {"role": "user", "content": "what is 2+2?"}),
         _StubSessionMessage(
@@ -201,23 +199,15 @@ async def test_attach_after_restart_seeds_eventlog_from_sdk_transcript(tmp_path,
     port = _free_port()
     with UvicornTestServer(app, port):
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10.0) as c:
-            # Attach to the OLD session id; should resume + seed from transcript.
-            events = await _read_sse_events(
-                c, f"/sessions/{sid}/stream", stop_at="message_complete", timeout=5.0
-            )
+            r = await c.get(f"/sessions/{sid}/history")
+            assert r.status_code == 200, r.text
+            body = r.json()
 
-    kinds = [e["event"] for e in events]
-    # Replayed transcript is visible to the attaching client.
-    assert "user_message" in kinds
-    assert "message_complete" in kinds
-
-    import json
-    user_evt = next(e for e in events if e["event"] == "user_message")
-    assert json.loads(user_evt["data"])["content"] == "what is 2+2?"
-    complete_evt = next(e for e in events if e["event"] == "message_complete")
-    assert json.loads(complete_evt["data"])["message"]["content"] == [{"type": "text", "text": "4"}]
-
-    # Lazy spawn: view-only attach doesn't invoke the factory. Transcript
-    # replay alone, served straight from the seeded EventLog, is enough to
-    # populate the chat — no SDK subprocess needed until the user sends.
+    kinds = [e["event"] for e in body["events"]]
+    assert kinds == ["user_message", "message_complete"], kinds
+    assert body["events"][0]["payload"]["content"] == "what is 2+2?"
+    assert body["events"][1]["payload"]["message"]["content"] == [
+        {"type": "text", "text": "4"}
+    ]
+    # Lazy spawn: fetching history does NOT invoke the factory.
     assert captured == []

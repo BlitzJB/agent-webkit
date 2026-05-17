@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 from hypothesis import HealthCheck, given, settings, strategies as st
 
-from agent_webkit_server.event_log import EventLog, EvictedError
+from agent_webkit_server.event_log import GlobalEventLog as EventLog, EvictedError
 
 
 _event_names = st.sampled_from(["a", "b", "c", "session_ready", "result"])
@@ -32,7 +32,7 @@ _payloads = st.dictionaries(st.text(min_size=0, max_size=8), st.integers(), max_
 async def test_subscribe_yields_exactly_events_after_cursor(events, after_seq) -> None:
     """For any append sequence + cursor, subscribe sees `[after_seq+1 .. last]` in order."""
     log = EventLog(max_size=1000)  # large enough to avoid eviction
-    appended = [log.append(name, data) for name, data in events]
+    appended = [log.append("s", name, data) for name, data in events]
 
     expected = [e for e in appended if e.seq > after_seq]
 
@@ -59,7 +59,7 @@ async def test_evicted_cursor_raises_for_any_overflow(max_size, n_events) -> Non
     """
     log = EventLog(max_size=max_size)
     for i in range(n_events):
-        log.append("e", i)
+        log.append("s", "e", i)
 
     if n_events > max_size:
         # The seq before the current oldest must be evicted.
@@ -81,7 +81,7 @@ async def test_evicted_cursor_raises_for_any_overflow(max_size, n_events) -> Non
 async def test_multi_subscriber_views_are_independent(events, cursors) -> None:
     """N subscribers with N different cursors each see exactly their own suffix."""
     log = EventLog(max_size=1000)
-    appended = [log.append(name, data) for name, data in events]
+    appended = [log.append("s", name, data) for name, data in events]
     log.close()
 
     async def collect(c: int) -> list[int]:

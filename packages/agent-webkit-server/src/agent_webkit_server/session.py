@@ -1,4 +1,11 @@
-"""Session — long-lived holder of the SDK client + inbound queue + event log."""
+"""Session — long-lived holder of the SDK client + inbound queue.
+
+Wire-event durability + multi-subscriber fan-out live on the
+:class:`GlobalEventLog` held by :class:`SessionRegistry`. Each session
+just owns its slice of behavior (the SDK client, the inbound message
+queue, the permission/question router) and writes its events into the
+shared global log with its own ``session_id`` stamped on every entry.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +15,7 @@ import uuid
 from typing import Any, Awaitable, Callable, Optional
 
 from . import PROTOCOL_VERSION
-from .event_log import EventLog, LoggedEvent
+from .event_log import GlobalEventLog
 from .sdk_bridge import (
     ConflictError,
     PermissionRouter,
@@ -17,7 +24,6 @@ from .sdk_bridge import (
     translate_sdk_messages,
 )
 from .session_metadata import SessionMetadata, SessionMetadataStore
-from .transcript_replay import transcript_to_events
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +66,7 @@ class Session:
         client: Optional[SDKClient] = None,
         *,
         spawn_client: Optional[Callable[[], Awaitable[SDKClient]]] = None,
-        event_log: Optional[EventLog] = None,
+        global_event_log: Optional[GlobalEventLog] = None,
         router: Optional[PermissionRouter] = None,
         idle_timeout_s: float = 300.0,
         on_sdk_session_id_change: Optional[Callable[[str], Awaitable[None]]] = None,
@@ -80,7 +86,11 @@ class Session:
         self._spawn_client = spawn_client
         self._start_lock: asyncio.Lock = asyncio.Lock()
         self._started: bool = client is not None
-        self.event_log = event_log if event_log is not None else EventLog()
+        # Wire events get stamped with self.id and written into the shared
+        # multiplexed log — there's no per-session log anymore. If a caller
+        # (tests, mostly) didn't pass one we create our own throwaway so the
+        # Session is self-contained.
+        self._global_event_log = global_event_log if global_event_log is not None else GlobalEventLog()
         self.router = router if router is not None else PermissionRouter()
         self.idle_timeout_s = idle_timeout_s
         # Native SDK session id, captured from the first ResultMessage. This
@@ -106,11 +116,20 @@ class Session:
     def idle_for(self) -> float:
         return time.monotonic() - self._last_activity
 
+    @property
+    def event_log(self) -> GlobalEventLog:
+        """Access to the underlying multiplexed log. Useful for tests; in
+        production callers should subscribe via the registry, not here."""
+        return self._global_event_log
+
+    def _emit(self, event: str, data: dict[str, Any]) -> None:
+        """Stamp every event with self.id before it hits the global log so
+        multiplexed subscribers can route by session."""
+        self._global_event_log.append(self.id, event, data)
+
     def emit_ready(self) -> None:
-        """Emit session_ready into the event log. Called by the registry at
-        shell-construction time so attaching SSE subscribers see the protocol
-        handshake immediately, without waiting for SDK spawn."""
-        self.event_log.append("session_ready", {
+        """Append session_ready for this session into the global log."""
+        self._emit("session_ready", {
             "session_id": self.id,
             "protocol_version": PROTOCOL_VERSION,
         })
@@ -147,7 +166,7 @@ class Session:
 
     async def _run_receive_loop(self) -> None:
         def emit(event: str, data: dict[str, Any]) -> None:
-            self.event_log.append(event, data)
+            self._emit(event, data)
             # `result` marks the end of a turn — release the send loop to dispatch the
             # next queued query. Per the spec: receive_messages() must finish draining
             # before accepting the next query().
@@ -168,7 +187,7 @@ class Session:
             raise
         except Exception as e:
             logger.exception("Receive loop crashed")
-            self.event_log.append("error", {"code": "receive_loop_crashed", "message": str(e)})
+            self._emit("error", {"code": "receive_loop_crashed", "message": str(e)})
         finally:
             # If the receive iterator stops (clean disconnect or crash), unblock any
             # waiter on _turn_done so the send loop can exit promptly.
@@ -203,7 +222,7 @@ class Session:
                 # On failure, re-open the gate so subsequent queries aren't deadlocked.
                 self._turn_done.set()
                 logger.exception("Failed to forward user message to SDK")
-                self.event_log.append("error", {"code": "query_failed", "message": str(e)})
+                self._emit("error", {"code": "query_failed", "message": str(e)})
 
     # --- Inbound dispatch (called by HTTP endpoint) ---
 
@@ -216,7 +235,7 @@ class Session:
         # so anyone reconnecting/attaching mid-conversation replays the full
         # transcript — assistant turns alone would look like the agent
         # talking to itself.
-        self.event_log.append("user_message", {"content": content})
+        self._emit("user_message", {"content": content})
         # SDK expects: {"type": "user", "message": {"role": "user", "content": ...}}
         wrapped = {"type": "user", "message": {"role": "user", "content": content}}
         try:
@@ -294,8 +313,9 @@ class Session:
                 await self.client.disconnect()
             except Exception:
                 logger.exception("client.disconnect failed")
-        self.event_log.append("done", {})
-        self.event_log.close()
+        # The global log isn't closed — other sessions keep using it.
+        # Emitting `done` lets subscribers know this particular session is over.
+        self._emit("done", {})
 
 
 class SessionRegistry:
@@ -305,6 +325,7 @@ class SessionRegistry:
         *,
         idle_timeout_s: float = 300.0,
         metadata_store: Optional[SessionMetadataStore] = None,
+        event_log: Optional[GlobalEventLog] = None,
     ) -> None:
         self._sdk_factory = sdk_factory
         self._sessions: dict[str, Session] = {}
@@ -317,6 +338,10 @@ class SessionRegistry:
         # transcript via transcript_replay.transcript_to_events — we don't
         # maintain a duplicate event journal.
         self._metadata_store = metadata_store
+        # The shared multiplexed event log. All sessions in this registry
+        # write their wire events into this single ring; the FastAPI
+        # `GET /stream` endpoint subscribes here to fan them out to clients.
+        self.event_log: GlobalEventLog = event_log or GlobalEventLog()
 
     def start_reaper(self) -> None:  # pragma: no cover - lifespan-managed background task
         if self._reaper_task is None or self._reaper_task.done():
@@ -351,26 +376,24 @@ class SessionRegistry:
         return session
 
     async def _build_session(self, session_id: str, config: SessionConfig) -> Session:
-        # Build the per-session router and event log up front so the can_use_tool
-        # callback can be constructed before the SDK client. The factory is
-        # deferred — wrapped in a closure passed as `spawn_client` — so that
-        # cold session resumes return a ready-to-stream shell without paying
-        # the multi-second SDK subprocess spawn. The first interaction
-        # (submit_user_message, interrupt, etc.) triggers the actual spawn
-        # via Session.ensure_started().
-        seed: Optional[list[LoggedEvent]] = None
-        if config.resume:
-            # Hydrate the in-memory ring from the SDK's authoritative on-disk
-            # transcript so attaching clients replay the full conversation
-            # without us maintaining a duplicate journal.
-            replay = await asyncio.to_thread(
-                transcript_to_events, config.resume, config.cwd
-            )
-            if replay:
-                seed = replay
-        event_log = EventLog(seed=seed)
+        # Build the per-session router up front so the can_use_tool callback can
+        # be constructed before the SDK client. The factory is deferred — wrapped
+        # in a closure passed as `spawn_client` — so that cold resumes return a
+        # ready-to-stream shell without paying the multi-second SDK subprocess
+        # spawn. The first interaction triggers the actual spawn via
+        # Session.ensure_started().
+        #
+        # Transcript replay is no longer wired into the wire event log — it's
+        # exposed via the separate GET /sessions/{id}/history endpoint so
+        # clients can fetch past messages on demand.
         router = PermissionRouter()
-        can_use_tool = build_can_use_tool(event_log.append, router)
+
+        # The bridge writes through a session-id-stamping shim so every wire
+        # event in this registry's global log carries its originating session.
+        def emit_with_session_id(event: str, data: dict[str, Any]) -> None:
+            self.event_log.append(session_id, event, data)
+
+        can_use_tool = build_can_use_tool(emit_with_session_id, router)
 
         async def _spawn() -> SDKClient:
             return await self._invoke_factory(config, can_use_tool)
@@ -396,7 +419,7 @@ class SessionRegistry:
         session = Session(
             session_id,
             spawn_client=_spawn,
-            event_log=event_log,
+            global_event_log=self.event_log,
             router=router,
             idle_timeout_s=self._idle_timeout_s,
             on_sdk_session_id_change=_on_sdk_id if self._metadata_store is not None else None,

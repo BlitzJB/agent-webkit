@@ -1,23 +1,31 @@
 """Translate the SDK's on-disk transcript into wire events for replay.
 
 The Claude Agent SDK already persists every turn to
-``~/.claude/projects/<cwd-hash>/<session-id>.jsonl``. On resume, instead of
-maintaining our own duplicate journal, we read directly from that
-authoritative store and translate the entries back into the wire-event
-shapes that ``EventLog`` holds — so a fresh ``EventLog`` can be seeded
-with the full historical transcript before any subscriber attaches.
+``~/.claude/projects/<cwd-hash>/<session-id>.jsonl``. The
+``GET /sessions/{id}/history`` endpoint reads from that store and
+translates the entries back into the same wire-event shapes the live
+multiplexed stream emits — so on first-attach a client can fetch its
+past once and then track future events over ``GET /stream``.
 
-This keeps the SDK as the single source of truth for transcripts and
-avoids the on-disk write coordination that a custom journal would need.
+This keeps the SDK as the single source of truth for transcripts.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any, Optional
 
-from .event_log import LoggedEvent
-
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReplayEvent:
+    """One wire event materialized from the SDK transcript. Same shape as
+    a :class:`ReplayEvent` minus the global-log specifics (session_id is
+    implicit — every event in a transcript replay belongs to one session)."""
+    seq: int
+    event: str
+    data: Any
 
 
 def transcript_to_events(
@@ -25,7 +33,7 @@ def transcript_to_events(
     cwd: Optional[str] = None,
     *,
     starting_seq: int = 1,
-) -> list[LoggedEvent]:
+) -> list[ReplayEvent]:
     """Read the SDK transcript for ``sdk_session_id`` and translate to wire events.
 
     Each ``SessionMessage`` (user/assistant) becomes:
@@ -56,7 +64,7 @@ def transcript_to_events(
     if not messages:
         return []
 
-    events: list[LoggedEvent] = []
+    events: list[ReplayEvent] = []
     seq = starting_seq
     fallback_id_counter = 0
 
@@ -87,14 +95,14 @@ def transcript_to_events(
                 user_content = non_tool if non_tool else None
 
             if user_content:
-                events.append(LoggedEvent(
+                events.append(ReplayEvent(
                     seq=_next_seq(),
                     event="user_message",
                     data={"content": user_content},
                 ))
 
             for blk in tool_results:
-                events.append(LoggedEvent(
+                events.append(ReplayEvent(
                     seq=_next_seq(),
                     event="tool_result",
                     data={
@@ -109,7 +117,7 @@ def transcript_to_events(
             msg_id = (msg.get("id") if isinstance(msg, dict) else None) or m.uuid or _fallback_id(fallback_id_counter)
             fallback_id_counter += 1
             blocks = content if isinstance(content, list) else []
-            events.append(LoggedEvent(
+            events.append(ReplayEvent(
                 seq=_next_seq(),
                 event="message_complete",
                 data={
@@ -126,7 +134,7 @@ def transcript_to_events(
             # Mirror the live bridge: surface each tool_use as a discrete event.
             for blk in blocks:
                 if isinstance(blk, dict) and blk.get("type") == "tool_use":
-                    events.append(LoggedEvent(
+                    events.append(ReplayEvent(
                         seq=_next_seq(),
                         event="tool_use",
                         data={

@@ -74,7 +74,7 @@ async def test_session_survives_process_restart_via_metadata_store(tmp_path) -> 
 
             events = await _read_sse_events(
                 c,
-                f"/sessions/{sid}/stream",
+                "/stream",
                 stop_at="result",
                 timeout=10.0,
             )
@@ -117,17 +117,21 @@ async def test_session_survives_process_restart_via_metadata_store(tmp_path) -> 
     with UvicornTestServer(app_v2, port_v2):
         base = f"http://127.0.0.1:{port_v2}"
         async with httpx.AsyncClient(base_url=base, timeout=10.0) as c:
-            # The OLD session id must still work — the fresh process resumes
-            # it from the metadata file. No need to POST /sessions again.
+            # The OLD session id must still work — fetching its history
+            # triggers the registry to resume from metadata (and emit
+            # session_ready into the multiplexed log).
+            hist = await c.get(f"/sessions/{sid}/history")
+            assert hist.status_code == 200, hist.text
             events_after = await _read_sse_events(
                 c,
-                f"/sessions/{sid}/stream",
+                "/stream",
                 stop_at="session_ready",
                 timeout=10.0,
+                session_id=sid,
             )
-            # Sanity: just attaching to view the transcript must NOT have
-            # spawned a new SDK subprocess (lazy spawn). Triggering an
-            # interaction does — and the factory then receives the resume id.
+            # Sanity: just viewing history must NOT have spawned a new SDK
+            # subprocess (lazy spawn). Triggering an interaction does —
+            # and the factory then receives the resume id.
             assert captured_v2 == [], "view-only attach must not invoke factory"
             await c.post(
                 f"/sessions/{sid}/input",
@@ -135,7 +139,7 @@ async def test_session_survives_process_restart_via_metadata_store(tmp_path) -> 
             )
             # Drain through result so the factory call has fully landed.
             await _read_sse_events(
-                c, f"/sessions/{sid}/stream", stop_at="result", timeout=10.0
+                c, "/stream", stop_at="result", timeout=10.0, session_id=sid,
             )
 
     # Stream connected successfully — no 404.
@@ -181,7 +185,7 @@ async def test_resume_clamps_stale_last_event_id(tmp_path) -> None:
                 f"/sessions/{sid}/input",
                 json={"type": "user_message", "content": "go"},
             )
-            await _read_sse_events(c, f"/sessions/{sid}/stream", stop_at="result", timeout=10.0)
+            await _read_sse_events(c, "/stream", stop_at="result", timeout=10.0)
 
     # Wait for sdk_session_id to land in metadata.
     for _ in range(50):
@@ -201,15 +205,19 @@ async def test_resume_clamps_stale_last_event_id(tmp_path) -> None:
     port2 = _free_port()
     with UvicornTestServer(app2, port2):
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port2}", timeout=10.0) as c:
+            # Touch /history to rebuild the session shell and put session_ready
+            # into the multiplexed log.
+            await c.get(f"/sessions/{sid}/history")
             events = await _read_sse_events(
                 c,
-                f"/sessions/{sid}/stream",
+                "/stream",
                 headers={"Last-Event-ID": "9999"},
                 stop_at="session_ready",
                 timeout=10.0,
+                session_id=sid,
             )
     # Despite the wildly-stale Last-Event-Id, session_ready was still delivered
-    # (handler clamped after_seq=9999 down to 0).
+    # (handler clamped after_seq=9999 down to 0 against the new global log).
     assert any(e["event"] == "session_ready" for e in events)
 
 
@@ -225,7 +233,8 @@ async def test_stream_for_unknown_session_still_404s_after_restart(tmp_path) -> 
     port = _free_port()
     with UvicornTestServer(app, port):
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=5.0) as c:
-            r = await c.get("/sessions/00000000-0000-0000-0000-000000000000/stream")
+            # /history is the per-session entry point now (used to be /stream).
+            r = await c.get("/sessions/00000000-0000-0000-0000-000000000000/history")
             assert r.status_code == 404
 
 
@@ -254,6 +263,6 @@ async def test_explicit_delete_purges_metadata_preventing_resume(tmp_path) -> No
             # Metadata is gone.
             assert await store.load(sid) is None
 
-            # And the next stream request 404s — no zombie resume.
-            r = await c.get(f"/sessions/{sid}/stream")
+            # And the next /history request 404s — no zombie resume.
+            r = await c.get(f"/sessions/{sid}/history")
             assert r.status_code == 404

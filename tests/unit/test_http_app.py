@@ -85,6 +85,35 @@ def server_factory():
     return make
 
 
+def _unwrap_envelope(events: list[dict[str, Any]], session_id: Optional[str] = None) -> list[dict[str, Any]]:
+    """Tests run against /stream's multiplexed envelope shape:
+    ``data = {"session_id": "...", "payload": {...}}``.
+
+    Most tests only care about one session at a time — unwrap each event's
+    payload to look like the pre-multiplex event shape (``data`` becomes the
+    payload), and optionally filter by session_id.
+    """
+    out: list[dict[str, Any]] = []
+    for ev in events:
+        try:
+            envelope = json.loads(ev["data"])
+        except (json.JSONDecodeError, TypeError):
+            out.append(ev)
+            continue
+        if not isinstance(envelope, dict) or "payload" not in envelope:
+            out.append(ev)
+            continue
+        if session_id is not None and envelope.get("session_id") != session_id:
+            continue
+        out.append({
+            "event": ev["event"],
+            "id": ev.get("id"),
+            "session_id": envelope.get("session_id"),
+            "data": json.dumps(envelope.get("payload")),
+        })
+    return out
+
+
 async def _read_sse_events(
     client: httpx.AsyncClient,
     path: str,
@@ -93,8 +122,13 @@ async def _read_sse_events(
     stop_at: Optional[str] = None,
     max_events: int = 200,
     timeout: float = 5.0,
+    session_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Drive an SSE stream and decode events. Stops on `stop_at` or `max_events`."""
+    """Drive an SSE stream and decode events. Stops on `stop_at` or `max_events`.
+
+    When ``session_id`` is given, parses each event's multiplex envelope and
+    returns the matching events with their inner payload as ``data``
+    (transparently for the caller — looks like a per-session stream)."""
     events: list[dict[str, Any]] = []
 
     async def run() -> list[dict[str, Any]]:
@@ -135,9 +169,12 @@ async def _read_sse_events(
         return events
 
     try:
-        return await asyncio.wait_for(run(), timeout=timeout)
+        raw = await asyncio.wait_for(run(), timeout=timeout)
     except asyncio.TimeoutError:
-        return events
+        raw = events
+    # /stream always delivers multiplex envelopes — unwrap so callers see the
+    # pre-multiplex event shape they expect. Filter by session_id when given.
+    return _unwrap_envelope(raw, session_id)
 
 
 @pytest.mark.asyncio
@@ -159,7 +196,7 @@ async def test_full_plain_qa_flow_via_http(server_factory):
             r = await c.post(f"/sessions/{sid}/input", json={"type": "user_message", "content": "hi"})
             assert r.status_code == 204
 
-            events = await _read_sse_events(c, f"/sessions/{sid}/stream", stop_at="result")
+            events = await _read_sse_events(c, "/stream", stop_at="result")
             names = [e["event"] for e in events]
             assert names[0] == "session_ready"
             assert "message_complete" in names
@@ -176,7 +213,7 @@ async def test_permission_request_roundtrip_and_409_on_double_reply(server_facto
             sid = (await c.post("/sessions", json={})).json()["session_id"]
             await c.post(f"/sessions/{sid}/input", json={"type": "user_message", "content": "go"})
 
-            events = await _read_sse_events(c, f"/sessions/{sid}/stream", stop_at="permission_request")
+            events = await _read_sse_events(c, "/stream", stop_at="permission_request", session_id=sid)
             perm = next(e for e in events if e["event"] == "permission_request")
             cid = json.loads(perm["data"])["correlation_id"]
 
@@ -227,7 +264,7 @@ async def test_delete_session_makes_session_404_after(server_factory):
             sid = (await c.post("/sessions", json={})).json()["session_id"]
             await c.post(f"/sessions/{sid}/input", json={"type": "user_message", "content": "x"})
 
-            await _read_sse_events(c, f"/sessions/{sid}/stream", stop_at="result")
+            await _read_sse_events(c, "/stream", stop_at="result")
             r = await c.delete(f"/sessions/{sid}")
             assert r.status_code == 204
             r2 = await c.post(f"/sessions/{sid}/input", json={"type": "interrupt"})
@@ -239,7 +276,7 @@ async def test_malformed_last_event_id_returns_400(server_factory):
     with server_factory("plain_qa") as base:
         async with httpx.AsyncClient(base_url=base, timeout=5.0) as c:
             sid = (await c.post("/sessions", json={})).json()["session_id"]
-            r = await c.get(f"/sessions/{sid}/stream", headers={"last-event-id": "not-a-number"})
+            r = await c.get("/stream", headers={"last-event-id": "not-a-number"})
             assert r.status_code == 400
 
 
@@ -250,14 +287,14 @@ async def test_resume_with_last_event_id_skips_already_seen(server_factory):
             sid = (await c.post("/sessions", json={})).json()["session_id"]
             await c.post(f"/sessions/{sid}/input", json={"type": "user_message", "content": "x"})
 
-            first = await _read_sse_events(c, f"/sessions/{sid}/stream", stop_at="result")
+            first = await _read_sse_events(c, "/stream", stop_at="result")
             ids = [e["id"] for e in first if e.get("id")]
             assert len(ids) >= 2
             resume_after = ids[-2]
 
             second = await _read_sse_events(
                 c,
-                f"/sessions/{sid}/stream",
+                "/stream",
                 headers={"last-event-id": resume_after},
                 stop_at="result",
             )

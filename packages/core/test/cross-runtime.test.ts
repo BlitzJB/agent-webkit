@@ -68,21 +68,25 @@ uvicorn.run(app, host='127.0.0.1', port=${port}, log_level='warning')
 
   it("creates a session, sends a message, receives session_ready + message_complete + result", async () => {
     const client = createAgentClient({ baseUrl: `http://127.0.0.1:${port}` });
-    const session = await client.createSession();
-    expect(session.protocolVersion).toBe("1.0");
+    const { session_id: sid, protocol_version } = await client.createSession();
+    expect(protocol_version).toBe("1.0");
 
-    await session.send("hi");
+    await client.send(sid, "hi");
 
-    const events: { event: string; id: number }[] = [];
-    for await (const ev of session.events()) {
-      events.push({ event: ev.event, id: ev.id });
-      if (ev.event === "result") break;
+    const ac = new AbortController();
+    const events: { event: string; id: number; sid: string }[] = [];
+    for await (const ev of client.events({ signal: ac.signal })) {
+      events.push({ event: ev.event, id: ev.id, sid: ev.session_id });
+      if (ev.event === "result" && ev.session_id === sid) {
+        ac.abort();
+        break;
+      }
     }
-    const names = events.map((e) => e.event);
-    expect(names[0]).toBe("session_ready");
-    expect(names).toContain("message_complete");
-    expect(names[names.length - 1]).toBe("result");
-    await session.close();
+    const ours = events.filter((e) => e.sid === sid).map((e) => e.event);
+    expect(ours[0]).toBe("session_ready");
+    expect(ours).toContain("message_complete");
+    expect(ours[ours.length - 1]).toBe("result");
+    await client.deleteSession(sid);
   }, 15_000);
 });
 
@@ -163,18 +167,23 @@ uvicorn.run(app, host='127.0.0.1', port=${port}, log_level='warning')
     await ui.loadSchema();
 
     const client = createAgentClient({ baseUrl: `http://127.0.0.1:${port}` });
-    const session = await client.createSession();
-    await session.send("Render Boston weather.");
+    const { session_id: sid } = await client.createSession();
+    await client.send(sid, "Render Boston weather.");
 
     let toolUseSeen = false;
     let parsedUpdate: ReturnType<GenUIStream["feed"]> = null;
+    const ac = new AbortController();
 
-    for await (const ev of session.events()) {
+    for await (const ev of client.events({ signal: ac.signal })) {
+      if (ev.session_id !== sid) continue;
       if (ev.event === "tool_use") {
         toolUseSeen = true;
         parsedUpdate = ui.feed(ev);
       }
-      if (ev.event === "result") break;
+      if (ev.event === "result") {
+        ac.abort();
+        break;
+      }
     }
 
     expect(toolUseSeen).toBe(true);
@@ -187,6 +196,6 @@ uvicorn.run(app, host='127.0.0.1', port=${port}, log_level='warning')
       temperature_f: 72,
       condition: "sunny",
     });
-    await session.close();
+    await client.deleteSession(sid);
   }, 15_000);
 });

@@ -90,8 +90,9 @@ export type ServerEvent =
 export type ServerEventName = ServerEvent["event"];
 export type EventOf<N extends ServerEventName> = Extract<ServerEvent, { event: N }>;
 
-// Each delivered event is tagged with its monotonic server-side seq id.
-export type DeliveredEvent = ServerEvent & { id: number };
+// Each delivered event is tagged with its monotonic server-side seq id AND
+// the originating session_id (multiplexed across all sessions on one stream).
+export type DeliveredEvent = ServerEvent & { id: number; session_id: string };
 
 export interface AssistantMessage {
   id: string;
@@ -136,4 +137,31 @@ export interface CreateSessionOptions {
 export interface CreateSessionResponse {
   session_id: string;
   protocol_version: string;
+}
+
+export interface SessionListEntry {
+  id: string;
+  sdk_session_id: string | null;
+  model: string | null;
+  permission_mode: string | null;
+  cwd: string | null;
+  include_partial_messages: boolean;
+  created_at: number;
+  last_seen_at: number;
+}
+
+export interface SessionListResponse {
+  sessions: SessionListEntry[];
+}
+
+// Past wire events for a session — fetched via GET /sessions/{id}/history.
+// Each entry has the same `event` name and `payload` shape as the matching
+// event on /stream, minus the multiplex envelope.
+export interface HistoryEntry {
+  event: ServerEventName;
+  payload: unknown;
+}
+
+export interface HistoryResponse {
+  events: HistoryEntry[];
 }

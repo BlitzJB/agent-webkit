@@ -61,7 +61,7 @@ async def test_stream_events_surface_as_message_delta_then_complete() -> None:
 
             events = await _read_sse_events(
                 c,
-                f"/sessions/{sid}/stream",
+                "/stream",
                 stop_at="result",
                 timeout=10.0,
             )

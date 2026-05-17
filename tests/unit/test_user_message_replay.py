@@ -49,7 +49,7 @@ async def test_submit_user_message_appears_in_event_log() -> None:
             )
 
             events = await _read_sse_events(
-                c, f"/sessions/{sid}/stream", stop_at="result", timeout=10.0
+                c, "/stream", stop_at="result", timeout=10.0
             )
 
     kinds = [e["event"] for e in events]
@@ -82,13 +82,13 @@ async def test_attach_after_user_turn_replays_user_message() -> None:
                 json={"type": "user_message", "content": "first prompt"},
             )
             await _read_sse_events(
-                c, f"/sessions/{sid}/stream", stop_at="result", timeout=10.0
+                c, "/stream", stop_at="result", timeout=10.0
             )
 
             # Second subscriber attaches fresh (no Last-Event-ID) — gets the
             # full ring buffer including the user prompt.
             events = await _read_sse_events(
-                c, f"/sessions/{sid}/stream", stop_at="result", timeout=10.0
+                c, "/stream", stop_at="result", timeout=10.0
             )
 
     kinds = [e["event"] for e in events]

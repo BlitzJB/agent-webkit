@@ -23,6 +23,7 @@ from ..models import (
     InboundMessage,
 )
 from ..sdk_bridge import ConflictError, SDKClient
+from ..transcript_replay import transcript_to_events
 from ..session import BackpressureError, SessionConfig, SessionRegistry
 
 logger = logging.getLogger(__name__)
@@ -180,36 +181,40 @@ def create_app(
         await registry.remove(session_id)
         return Response(status_code=204)
 
-    @app.get("/sessions/{session_id}/stream", dependencies=[Depends(auth_dep)])
-    async def stream(session_id: str, request: Request) -> StreamingResponse:
-        s = await registry.get_or_resume(session_id)
-        if s is None:
-            raise HTTPException(status_code=404, detail="Session not found")
+    @app.get("/stream", dependencies=[Depends(auth_dep)])
+    async def stream(request: Request) -> StreamingResponse:
+        """Process-global multiplexed SSE.
+
+        Every wire event from every session in this process flows over this
+        single connection. Each frame's ``data`` payload is wrapped:
+
+            {"session_id": "...", "payload": {...original event payload...}}
+
+        so the client can dispatch by ``session_id`` into a keyed reducer.
+        Standard ``Last-Event-Id`` resume against the single monotonic seq.
+
+        There is no separate per-session stream endpoint — clients fetch
+        ``GET /sessions/{id}/history`` for the past, then read this stream
+        for the future.
+        """
         last_event_id = request.headers.get("last-event-id")
         if last_event_id is None or last_event_id == "":
             after_seq = 0
         elif last_event_id.isdigit():
             after_seq = int(last_event_id)
         else:
-            # Reject malformed headers loudly rather than silently restarting from 0 —
-            # silent fallback would replay the entire stream and produce duplicate events
-            # in clients that thought they were resuming.
             raise HTTPException(status_code=400, detail="Last-Event-ID must be a non-negative integer")
 
-        # Resume edge case: the session was rebuilt from metadata, so the new
-        # event_log starts at seq 1. A client reconnecting with `Last-Event-Id`
-        # from the old log would point past our current max — clamp it so the
-        # subscription doesn't sit there forever waiting for events with
-        # impossibly-large seq numbers.
-        if after_seq > s.event_log.last_seq:
+        # Clamp a stale Last-Event-ID that's beyond our current max. Easy way
+        # for a client to "give up on past" without forcing them to know our
+        # internal seq state.
+        if after_seq > registry.event_log.last_seq:
             after_seq = 0
 
-        # Pre-flight: if the cursor is evicted, return 412 before opening the stream.
+        # Pre-flight: surface 412 (evicted) before opening the SSE response.
         if after_seq:
             try:
-                # subscribe()'s constructor doesn't run; iterate one step to detect.
-                gen_iter = s.event_log.subscribe(after_seq).__aiter__()
-                # Try to advance once with a 0-timeout so we never block.
+                gen_iter = registry.event_log.subscribe(after_seq).__aiter__()
                 try:
                     await asyncio.wait_for(gen_iter.__anext__(), timeout=0.001)
                 except (asyncio.TimeoutError, StopAsyncIteration):
@@ -220,20 +225,12 @@ def create_app(
                 raise HTTPException(status_code=412, detail=str(e))
 
         async def gen() -> AsyncIterator[bytes]:
-            # Short keepalive so client disconnects propagate fast — without
-            # this, an aborted SSE stream sits in `await sub.__anext__()` until
-            # the next event or timeout, holding the TCP slot (and tying up
-            # one of the browser's per-origin connection slots). Rapid session
-            # switching under HTTP/1.1 would otherwise queue up requests
-            # behind half-dead streams. 2s is short enough that switches feel
-            # snappy and long enough to be ignored by intermediaries.
+            # 2s keepalive so client disconnects propagate fast and idle
+            # intermediaries don't drop us.
             keepalive_interval = 2.0
             try:
-                sub = s.event_log.subscribe(after_seq).__aiter__()
+                sub = registry.event_log.subscribe(after_seq).__aiter__()
                 while True:
-                    # Bail out as soon as the client closes the connection,
-                    # rather than waiting for the next event/keepalive write
-                    # to discover the broken pipe.
                     if await request.is_disconnected():
                         return
                     try:
@@ -243,14 +240,15 @@ def create_app(
                         continue
                     except StopAsyncIteration:
                         return
+                    # Wrap every event in the multiplex envelope so the client
+                    # can route to the right per-session reducer slot.
+                    envelope = {"session_id": ev.session_id, "payload": ev.data}
                     payload = (
                         f"id: {ev.seq}\n"
                         f"event: {ev.event}\n"
-                        f"data: {json.dumps(ev.data)}\n\n"
+                        f"data: {json.dumps(envelope)}\n\n"
                     ).encode("utf-8")
                     yield payload
-                    if ev.event == "done":
-                        return
             except EvictedError as e:
                 msg = json.dumps({"code": "evicted", "message": str(e)})
                 yield f"event: error\ndata: {msg}\n\n".encode("utf-8")
@@ -261,6 +259,38 @@ def create_app(
             "x-accel-buffering": "no",
         }
         return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
+
+    @app.get("/sessions/{session_id}/history", dependencies=[Depends(auth_dep)])
+    async def session_history(session_id: str) -> JSONResponse:
+        """One-shot snapshot of past wire events for this session, sourced
+        from the SDK's on-disk transcript via :func:`transcript_to_events`.
+        Clients call this on first-attach to a session to populate past
+        messages, then read live future events from ``GET /stream``.
+
+        Returns ``{"events": [{event, payload}, ...]}`` where payload is the
+        same shape used inside the ``/stream`` envelope. Sessions that don't
+        exist at all (no metadata, no SDK transcript) return 404; sessions
+        that exist but have no transcript yet return ``{"events": []}``.
+        """
+        s = await registry.get_or_resume(session_id)
+        if s is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        sdk_id = s.sdk_session_id
+        if sdk_id is None and registry._metadata_store is not None:
+            md = await registry._metadata_store.load(session_id)
+            if md is not None:
+                sdk_id = md.sdk_session_id
+        cwd: Optional[str] = None
+        if registry._metadata_store is not None:
+            md = await registry._metadata_store.load(session_id)
+            if md is not None:
+                cwd = md.cwd
+        events_list: list[dict[str, Any]] = []
+        if sdk_id is not None:
+            replay = await asyncio.to_thread(transcript_to_events, sdk_id, cwd)
+            for ev in replay:
+                events_list.append({"event": ev.event, "payload": ev.data})
+        return JSONResponse({"events": events_list})
 
     @app.post("/sessions/{session_id}/input", dependencies=[Depends(auth_dep)])
     async def input_message(session_id: str, request: Request) -> Response:

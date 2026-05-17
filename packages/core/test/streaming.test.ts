@@ -1,14 +1,41 @@
 /**
  * L1 streaming tests — verifies that `message_delta` events flow through the
- * SSE parser, Transport reader, and Session.events() in chunk-boundary-safe
- * order. The L1 SDK has no "message accumulator" — it just emits typed events
- * — so these tests live at the wire level: parser correctness across chunked
- * deltas, transport ordering, and protocol typing for text + input_json_delta.
+ * SSE parser, Transport reader, and AgentClient.events() in chunk-boundary-safe
+ * order, with the multiplex envelope unwrapped.
+ *
+ * The L1 SDK has no "message accumulator" — it just emits typed events tagged
+ * with session_id — so these tests live at the wire level: parser correctness
+ * across chunked deltas, transport ordering, and protocol typing for text +
+ * input_json_delta.
  */
 import { describe, it, expect } from "vitest";
-import { createAgentClient } from "../src/index.js";
+import { createAgentClient, type AgentClient } from "../src/index.js";
 import { feedSSE, newSSEParserState } from "../src/sse.js";
 import type { DeliveredEvent } from "../src/types.js";
+
+async function collectUntil(
+  client: AgentClient,
+  stop: (e: DeliveredEvent) => boolean,
+  timeoutMs = 2000,
+): Promise<DeliveredEvent[]> {
+  const ac = new AbortController();
+  const out: DeliveredEvent[] = [];
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    for await (const ev of client.events({ signal: ac.signal })) {
+      out.push(ev);
+      if (stop(ev)) {
+        ac.abort();
+        break;
+      }
+    }
+  } catch {
+    /* abort */
+  } finally {
+    clearTimeout(timer);
+  }
+  return out;
+}
 
 function makeFakeFetch(events: string): typeof fetch {
   return async (input, init) => {
@@ -21,13 +48,13 @@ function makeFakeFetch(events: string): typeof fetch {
         { status: 200, headers: { "content-type": "application/json" } }
       );
     }
-    if (method === "GET" && path === "/sessions/sess-1/stream") {
+    if (method === "GET" && path === "/stream") {
       return new Response(events, {
         status: 200,
         headers: { "content-type": "text/event-stream" },
       });
     }
-    if (method === "POST" && path === "/sessions/sess-1/input") {
+    if (method === "POST" && path.startsWith("/sessions/") && path.endsWith("/input")) {
       return new Response(null, { status: 204 });
     }
     if (method === "DELETE") return new Response(null, { status: 204 });
@@ -35,81 +62,85 @@ function makeFakeFetch(events: string): typeof fetch {
   };
 }
 
-// Build a chunked SSE stream that delivers many small text deltas followed by
-// the final message_complete and a result frame.
-function streamingTextWire(messageId: string, tokens: string[]): string {
+// Multiplex envelope frame on the wire.
+function frame(seq: number, eventName: string, sessionId: string, payload: unknown): string {
+  return `id: ${seq}\nevent: ${eventName}\ndata: ${JSON.stringify({ session_id: sessionId, payload })}\n\n`;
+}
+
+// Build a multiplexed wire stream that delivers many text deltas + final
+// message_complete + result for a given session.
+function streamingTextWire(sessionId: string, messageId: string, tokens: string[]): string {
   const parts: string[] = [
-    'id: 1\nevent: session_ready\ndata: {"session_id":"sess-1","protocol_version":"1.0"}\n\n',
+    frame(1, "session_ready", sessionId, { session_id: sessionId, protocol_version: "1.0" }),
   ];
   tokens.forEach((tok, i) => {
     parts.push(
-      `id: ${i + 2}\nevent: message_delta\ndata: ${JSON.stringify({
+      frame(i + 2, "message_delta", sessionId, {
         message_id: messageId,
         delta: { type: "text", text: tok },
-      })}\n\n`
+      })
     );
   });
   const full = tokens.join("");
   parts.push(
-    `id: ${tokens.length + 2}\nevent: message_complete\ndata: ${JSON.stringify({
+    frame(tokens.length + 2, "message_complete", sessionId, {
       message_id: messageId,
-      message: {
-        id: messageId,
-        role: "assistant",
-        content: [{ type: "text", text: full }],
-      },
-    })}\n\n`
+      message: { id: messageId, role: "assistant", content: [{ type: "text", text: full }] },
+    })
   );
   parts.push(
-    `id: ${tokens.length + 3}\nevent: result\ndata: {"session_id":"sess-1","subtype":"success","total_cost_usd":0.01}\n\n`
+    frame(tokens.length + 3, "result", sessionId, {
+      session_id: sessionId,
+      subtype: "success",
+      total_cost_usd: 0.01,
+    })
   );
-  parts.push(`id: ${tokens.length + 4}\nevent: done\ndata: {}\n\n`);
+  parts.push(frame(tokens.length + 4, "done", sessionId, {}));
   return parts.join("");
 }
 
-describe("L1 streaming — message_delta over Session.events()", () => {
-  it("yields every delta in order followed by message_complete", async () => {
+describe("L1 streaming — message_delta over AgentClient.events()", () => {
+  it("yields every delta in order followed by message_complete, tagged with session_id", async () => {
     const tokens = ["Hel", "lo", " ", "world"];
     const client = createAgentClient({
       baseUrl: "http://x",
-      fetchImpl: makeFakeFetch(streamingTextWire("m1", tokens)),
+      fetchImpl: makeFakeFetch(streamingTextWire("sess-1", "m1", tokens)),
     });
-    const session = await client.createSession();
+    await client.createSession();
 
-    const observed: { event: string; preview?: string }[] = [];
-    for await (const ev of session.events()) {
+    const collected = await collectUntil(client, (ev) => ev.event === "done");
+    const observed: { event: string; sid: string; preview?: string }[] = collected.map((ev) => {
       if (ev.event === "message_delta") {
         const d = ev.data as { delta: { text?: string } };
-        observed.push({ event: "message_delta", preview: d.delta.text });
-      } else if (ev.event === "message_complete") {
-        const d = ev.data as { message: { content: Array<{ text?: string }> } };
-        observed.push({ event: "message_complete", preview: d.message.content[0]?.text });
-      } else {
-        observed.push({ event: ev.event });
+        return { event: "message_delta", sid: ev.session_id, preview: d.delta.text };
       }
-    }
+      if (ev.event === "message_complete") {
+        const d = ev.data as { message: { content: Array<{ text?: string }> } };
+        return { event: "message_complete", sid: ev.session_id, preview: d.message.content[0]?.text };
+      }
+      return { event: ev.event, sid: ev.session_id };
+    });
 
     expect(observed).toEqual([
-      { event: "session_ready" },
-      { event: "message_delta", preview: "Hel" },
-      { event: "message_delta", preview: "lo" },
-      { event: "message_delta", preview: " " },
-      { event: "message_delta", preview: "world" },
-      { event: "message_complete", preview: "Hello world" },
-      { event: "result" },
-      { event: "done" },
+      { event: "session_ready", sid: "sess-1" },
+      { event: "message_delta", sid: "sess-1", preview: "Hel" },
+      { event: "message_delta", sid: "sess-1", preview: "lo" },
+      { event: "message_delta", sid: "sess-1", preview: " " },
+      { event: "message_delta", sid: "sess-1", preview: "world" },
+      { event: "message_complete", sid: "sess-1", preview: "Hello world" },
+      { event: "result", sid: "sess-1" },
+      { event: "done", sid: "sess-1" },
     ]);
   });
 
   it("typed delta payload exposes text and message_id", async () => {
-    const wire = streamingTextWire("m_typed", ["A", "B"]);
+    const wire = streamingTextWire("sess-1", "m_typed", ["A", "B"]);
     const client = createAgentClient({
       baseUrl: "http://x",
       fetchImpl: makeFakeFetch(wire),
     });
-    const session = await client.createSession();
-    const collected: DeliveredEvent[] = [];
-    for await (const ev of session.events()) collected.push(ev);
+    await client.createSession();
+    const collected = await collectUntil(client, (ev) => ev.event === "done");
     const deltas = collected.filter((e) => e.event === "message_delta");
     expect(deltas).toHaveLength(2);
     for (const d of deltas) {
@@ -119,24 +150,23 @@ describe("L1 streaming — message_delta over Session.events()", () => {
     }
   });
 
-  it("session.lastEventId advances to the last delivered delta id", async () => {
-    const wire = streamingTextWire("m_id", ["x", "y", "z"]);
+  it("client.lastEventId advances to the last delivered delta id", async () => {
+    const wire = streamingTextWire("sess-1", "m_id", ["x", "y", "z"]);
     const client = createAgentClient({
       baseUrl: "http://x",
       fetchImpl: makeFakeFetch(wire),
     });
-    const session = await client.createSession();
+    await client.createSession();
     // tokens=3 → session_ready(1) + 3 deltas + complete + result + done = id 7
-    let last: string | undefined;
-    for await (const ev of session.events()) last = String(ev.id);
-    expect(session.lastEventId).toBe(last);
-    expect(session.lastEventId).toBe("7");
+    const collected = await collectUntil(client, (ev) => ev.event === "done");
+    expect(client.lastEventId).toBe(String(collected[collected.length - 1]!.id));
+    expect(client.lastEventId).toBe("7");
   });
 
   it("forwards input_json_delta deltas verbatim (for GenUI buffering)", async () => {
     const wire = [
-      'id: 1\nevent: session_ready\ndata: {"session_id":"sess-1","protocol_version":"1.0"}\n\n',
-      `id: 2\nevent: message_delta\ndata: ${JSON.stringify({
+      frame(1, "session_ready", "sess-1", { session_id: "sess-1", protocol_version: "1.0" }),
+      frame(2, "message_delta", "sess-1", {
         message_id: "m_gen",
         delta: {
           type: "input_json_delta",
@@ -144,28 +174,26 @@ describe("L1 streaming — message_delta over Session.events()", () => {
           tool_use_id: "tu_42",
           name: "mcp__genui__render_weather_card",
         },
-      })}\n\n`,
-      `id: 3\nevent: message_delta\ndata: ${JSON.stringify({
+      }),
+      frame(3, "message_delta", "sess-1", {
         message_id: "m_gen",
         delta: {
           type: "input_json_delta",
           partial_json: '"Boston"}',
           tool_use_id: "tu_42",
         },
-      })}\n\n`,
-      'id: 4\nevent: done\ndata: {}\n\n',
+      }),
+      frame(4, "done", "sess-1", {}),
     ].join("");
     const client = createAgentClient({
       baseUrl: "http://x",
       fetchImpl: makeFakeFetch(wire),
     });
-    const session = await client.createSession();
-    const deltas: Array<Record<string, unknown>> = [];
-    for await (const ev of session.events()) {
-      if (ev.event === "message_delta") {
-        deltas.push((ev.data as { delta: Record<string, unknown> }).delta);
-      }
-    }
+    await client.createSession();
+    const collected = await collectUntil(client, (ev) => ev.event === "done");
+    const deltas = collected
+      .filter((ev) => ev.event === "message_delta")
+      .map((ev) => (ev.data as { delta: Record<string, unknown> }).delta);
     expect(deltas).toEqual([
       {
         type: "input_json_delta",
@@ -227,12 +255,8 @@ describe("L1 streaming — SSE parser robustness across fragmented chunks", () =
 
   it("a comment line interleaved between deltas does not break the next dispatch", () => {
     const s = newSSEParserState();
-    const wire =
-      'id: 1\nevent: message_delta\ndata: {"message_id":"m","delta":{"text":"A"}}\n\n' +
-      ": keepalive\n\n" +
-      'id: 2\nevent: message_delta\ndata: {"message_id":"m","delta":{"text":"B"}}\n\n';
-    const out = feedSSE(s, wire);
-    expect(out).toHaveLength(2);
+    const data = `${frame(1, "x", "s", { v: 1 })}: keepalive\n\n${frame(2, "x", "s", { v: 2 })}`;
+    const out = feedSSE(s, data);
     expect(out.map((e) => e.id)).toEqual(["1", "2"]);
   });
 });

@@ -2,16 +2,17 @@ import type {
   AssistantMessage,
   ContentBlock,
   DeliveredEvent,
-  ServerEvent,
+  HistoryEntry,
 } from "@agent-webkit/core";
 
-// --- Reducer state ---
+// ────────────────────────────────────────────────────────────────────────────
+// L2 reducer — keyed-by-session-id state for the multiplex model.
 //
-// We hold a flat list of "displayed messages": user messages we sent, and assistant
-// messages reconciled from delta + complete events (keyed by message_id).
-//
-// Tool uses and tool results are attached as blocks within their owning message
-// for rendering; we don't try to imitate the SDK's internal block-stream nuances.
+// The L1 client opens one persistent /stream that yields events tagged with
+// session_id. The L2 reducer keeps a per-session SessionState slot inside a
+// MuxState, and routes every event to its slot. Components select a single
+// session's state via a thin selector hook.
+// ────────────────────────────────────────────────────────────────────────────
 
 export type DisplayMessage =
   | { kind: "user"; id: string; content: string | ContentBlock[] }
@@ -44,7 +45,8 @@ export interface PendingQuestion {
   questions: { questions: { question: string; header?: string; multiSelect?: boolean; options: { label: string; description?: string }[] }[] };
 }
 
-export interface AgentState {
+/** Per-session state — what useActiveSession exposes for a single sid. */
+export interface SessionState {
   messages: DisplayMessage[];
   status: Status;
   pendingPermission: PendingPermission | null;
@@ -53,7 +55,14 @@ export interface AgentState {
   totalCostUsd: number;
 }
 
-export const initialState: AgentState = {
+/** Top-level mux state — many sessions, keyed by id. */
+export interface MuxState {
+  sessions: Record<string, SessionState>;
+  /** Most recent global error (e.g. stream connection failure not tied to a session). */
+  streamError: { code: string; message: string } | null;
+}
+
+export const initialSessionState: SessionState = {
   messages: [],
   status: "idle",
   pendingPermission: null,
@@ -62,15 +71,31 @@ export const initialState: AgentState = {
   totalCostUsd: 0,
 };
 
+export const initialMuxState: MuxState = {
+  sessions: {},
+  streamError: null,
+};
+
 export type Action =
-  | { type: "local_user_message"; content: string | ContentBlock[]; localId: string }
+  | {
+      type: "local_user_message";
+      sessionId: string;
+      content: string | ContentBlock[];
+      localId: string;
+    }
   | { type: "server_event"; event: DeliveredEvent }
-  | { type: "permission_resolved"; correlationId: string }
-  | { type: "question_resolved"; correlationId: string };
+  | {
+      type: "history_loaded";
+      sessionId: string;
+      events: HistoryEntry[];
+    }
+  | { type: "ensure_session"; sessionId: string }
+  | { type: "remove_session"; sessionId: string }
+  | { type: "permission_resolved"; sessionId: string; correlationId: string }
+  | { type: "question_resolved"; sessionId: string; correlationId: string }
+  | { type: "stream_error"; error: { code: string; message: string } };
 
 function appendDelta(blocks: ContentBlock[], delta: unknown): ContentBlock[] {
-  // The SDK emits deltas as either a partial ContentBlock or a `{text}` chunk.
-  // We treat a `{text}` chunk as appending to the last text block (or creating one).
   if (delta && typeof delta === "object") {
     const d = delta as { type?: string; text?: string };
     if (d.type === undefined && typeof d.text === "string") {
@@ -87,178 +112,211 @@ function appendDelta(blocks: ContentBlock[], delta: unknown): ContentBlock[] {
       }
       return [...blocks, { type: "text", text: d.text }];
     }
-    // tool_use / image deltas: append as-is
     return [...blocks, delta as ContentBlock];
   }
   return blocks;
 }
 
-export function reduce(state: AgentState, action: Action): AgentState {
-  switch (action.type) {
-    case "local_user_message":
+function getOrInit(state: MuxState, sid: string): SessionState {
+  return state.sessions[sid] ?? initialSessionState;
+}
+
+function set(state: MuxState, sid: string, next: SessionState): MuxState {
+  return { ...state, sessions: { ...state.sessions, [sid]: next } };
+}
+
+/**
+ * Apply one server event to a single session's state. Mirrors the
+ * pre-multiplex reducer behavior, but operates on a single SessionState.
+ */
+function reduceSession(s: SessionState, event: string, data: any, seqId: number): SessionState {
+  switch (event) {
+    case "session_ready":
+      return s;
+
+    case "user_message": {
+      const content = data.content;
+      // Dedupe against optimistic local insert from local_user_message.
+      const last = s.messages[s.messages.length - 1];
+      if (
+        last &&
+        last.kind === "user" &&
+        JSON.stringify(last.content) === JSON.stringify(content)
+      ) {
+        return s;
+      }
       return {
-        ...state,
+        ...s,
+        messages: [...s.messages, { kind: "user", id: `srv-${seqId}`, content }],
+      };
+    }
+
+    case "message_delta": {
+      const { message_id, delta } = data;
+      const idx = s.messages.findIndex(
+        (m) => m.kind === "assistant" && m.message_id === message_id
+      );
+      if (idx === -1) {
+        const newMsg: DisplayMessage = {
+          kind: "assistant",
+          id: message_id,
+          message_id,
+          content: appendDelta([], delta),
+          streaming: true,
+        };
+        return { ...s, messages: [...s.messages, newMsg], status: "streaming" };
+      }
+      const existing = s.messages[idx]!;
+      if (existing.kind !== "assistant") return s;
+      const updated: DisplayMessage = {
+        ...existing,
+        content: appendDelta(existing.content, delta),
+        streaming: true,
+      };
+      const messages = [...s.messages];
+      messages[idx] = updated;
+      return { ...s, messages, status: "streaming" };
+    }
+
+    case "message_complete": {
+      const { message_id, message } = data;
+      const idx = s.messages.findIndex(
+        (m) => m.kind === "assistant" && m.message_id === message_id
+      );
+      const reconciled: DisplayMessage = {
+        kind: "assistant",
+        id: message_id,
+        message_id,
+        content: (message as AssistantMessage).content,
+        streaming: false,
+      };
+      if (idx === -1) {
+        return { ...s, messages: [...s.messages, reconciled] };
+      }
+      const messages = [...s.messages];
+      messages[idx] = reconciled;
+      return { ...s, messages };
+    }
+
+    case "tool_use":
+      return s;
+
+    case "tool_result": {
+      const { tool_use_id, output, is_error } = data;
+      return {
+        ...s,
         messages: [
-          ...state.messages,
+          ...s.messages,
+          { kind: "tool_result", id: `tr-${tool_use_id}`, tool_use_id, output, is_error },
+        ],
+      };
+    }
+
+    case "permission_request":
+      return {
+        ...s,
+        pendingPermission: {
+          correlation_id: data.correlation_id,
+          tool_name: data.tool_name,
+          input: data.input,
+          ...(data.context !== undefined ? { context: data.context } : {}),
+        },
+        status: "awaiting_permission",
+      };
+
+    case "ask_user_question":
+      return {
+        ...s,
+        pendingQuestion: {
+          correlation_id: data.correlation_id,
+          questions: data.questions,
+        },
+        status: "awaiting_question",
+      };
+
+    case "hook_decision_request":
+      return { ...s, status: "awaiting_hook" };
+
+    case "result": {
+      const cost = typeof data.total_cost_usd === "number" ? data.total_cost_usd : 0;
+      return { ...s, totalCostUsd: s.totalCostUsd + cost, status: "idle" };
+    }
+
+    case "error":
+      return { ...s, status: "error", lastError: data };
+
+    case "mcp_status_change":
+      return s;
+
+    case "done":
+      return { ...s, status: "idle" };
+  }
+  return s;
+}
+
+export function reduce(state: MuxState, action: Action): MuxState {
+  switch (action.type) {
+    case "ensure_session": {
+      if (state.sessions[action.sessionId]) return state;
+      return set(state, action.sessionId, initialSessionState);
+    }
+
+    case "remove_session": {
+      if (!(action.sessionId in state.sessions)) return state;
+      const next = { ...state.sessions };
+      delete next[action.sessionId];
+      return { ...state, sessions: next };
+    }
+
+    case "local_user_message": {
+      const s = getOrInit(state, action.sessionId);
+      return set(state, action.sessionId, {
+        ...s,
+        messages: [
+          ...s.messages,
           { kind: "user", id: action.localId, content: action.content },
         ],
         status: "streaming",
-      };
+      });
+    }
 
     case "server_event": {
       const ev = action.event;
-      switch (ev.event) {
-        case "session_ready":
-          return state;
-
-        case "user_message": {
-          // The server echoes every accepted user turn into the event log so
-          // attaching mid-conversation replays the full transcript. When the
-          // user typed this live in *this* client we already did an optimistic
-          // local_user_message insert — dedupe by content match against the
-          // most recent user-kind message to avoid showing the same prompt
-          // twice. (Pure replay case: no prior local insert, just append.)
-          const content = ev.data.content;
-          const last = state.messages[state.messages.length - 1];
-          if (
-            last &&
-            last.kind === "user" &&
-            JSON.stringify(last.content) === JSON.stringify(content)
-          ) {
-            return state;
-          }
-          return {
-            ...state,
-            messages: [
-              ...state.messages,
-              { kind: "user", id: `srv-${ev.id}`, content },
-            ],
-          };
-        }
-
-        case "message_delta": {
-          const { message_id, delta } = ev.data;
-          const idx = state.messages.findIndex(
-            (m) => m.kind === "assistant" && m.message_id === message_id
-          );
-          if (idx === -1) {
-            const newMsg: DisplayMessage = {
-              kind: "assistant",
-              id: message_id,
-              message_id,
-              content: appendDelta([], delta),
-              streaming: true,
-            };
-            return { ...state, messages: [...state.messages, newMsg], status: "streaming" };
-          }
-          const existing = state.messages[idx]!;
-          if (existing.kind !== "assistant") return state;
-          const updated: DisplayMessage = {
-            ...existing,
-            content: appendDelta(existing.content, delta),
-            streaming: true,
-          };
-          const messages = [...state.messages];
-          messages[idx] = updated;
-          return { ...state, messages, status: "streaming" };
-        }
-
-        case "message_complete": {
-          const { message_id, message } = ev.data;
-          const idx = state.messages.findIndex(
-            (m) => m.kind === "assistant" && m.message_id === message_id
-          );
-          const reconciled: DisplayMessage = {
-            kind: "assistant",
-            id: message_id,
-            message_id,
-            content: (message as AssistantMessage).content,
-            streaming: false,
-          };
-          if (idx === -1) {
-            return { ...state, messages: [...state.messages, reconciled] };
-          }
-          const messages = [...state.messages];
-          messages[idx] = reconciled;
-          return { ...state, messages };
-        }
-
-        case "tool_use":
-          // We rely on `message_complete` to surface tool_use blocks in their final form;
-          // delta-stream tool_use is best-effort already handled in message_delta.
-          return state;
-
-        case "tool_result": {
-          const { tool_use_id, output, is_error } = ev.data;
-          return {
-            ...state,
-            messages: [
-              ...state.messages,
-              {
-                kind: "tool_result",
-                id: `tr-${tool_use_id}`,
-                tool_use_id,
-                output,
-                is_error,
-              },
-            ],
-          };
-        }
-
-        case "permission_request":
-          return {
-            ...state,
-            pendingPermission: {
-              correlation_id: ev.data.correlation_id,
-              tool_name: ev.data.tool_name,
-              input: ev.data.input,
-              ...(ev.data.context !== undefined ? { context: ev.data.context } : {}),
-            },
-            status: "awaiting_permission",
-          };
-
-        case "ask_user_question":
-          return {
-            ...state,
-            pendingQuestion: {
-              correlation_id: ev.data.correlation_id,
-              questions: ev.data.questions,
-            },
-            status: "awaiting_question",
-          };
-
-        case "hook_decision_request":
-          // v1 stub — surface via status only.
-          return { ...state, status: "awaiting_hook" };
-
-        case "result": {
-          const cost = typeof ev.data.total_cost_usd === "number" ? ev.data.total_cost_usd : 0;
-          return {
-            ...state,
-            totalCostUsd: state.totalCostUsd + cost,
-            status: "idle",
-          };
-        }
-
-        case "error":
-          return { ...state, status: "error", lastError: ev.data };
-
-        case "mcp_status_change":
-          return state;
-
-        case "done":
-          return { ...state, status: "idle" };
-      }
-      return state;
+      const sid = ev.session_id;
+      if (!sid) return state;
+      const cur = getOrInit(state, sid);
+      const next = reduceSession(cur, ev.event, ev.data as any, ev.id);
+      if (next === cur) return state;
+      return set(state, sid, next);
     }
 
-    case "permission_resolved":
-      if (state.pendingPermission?.correlation_id !== action.correlationId) return state;
-      return { ...state, pendingPermission: null, status: "streaming" };
+    case "history_loaded": {
+      // Replay the history through reduceSession to populate the per-session
+      // state slot with past messages. seq for history entries is synthetic.
+      let s = state.sessions[action.sessionId] ?? initialSessionState;
+      let seq = -1;
+      for (const e of action.events) {
+        s = reduceSession(s, e.event, e.payload as any, seq);
+        seq -= 1;
+      }
+      // History is a snapshot — coming back from past, so reset status to idle.
+      return set(state, action.sessionId, { ...s, status: "idle" });
+    }
 
-    case "question_resolved":
-      if (state.pendingQuestion?.correlation_id !== action.correlationId) return state;
-      return { ...state, pendingQuestion: null, status: "streaming" };
+    case "permission_resolved": {
+      const s = state.sessions[action.sessionId];
+      if (!s || s.pendingPermission?.correlation_id !== action.correlationId) return state;
+      return set(state, action.sessionId, { ...s, pendingPermission: null, status: "streaming" });
+    }
+
+    case "question_resolved": {
+      const s = state.sessions[action.sessionId];
+      if (!s || s.pendingQuestion?.correlation_id !== action.correlationId) return state;
+      return set(state, action.sessionId, { ...s, pendingQuestion: null, status: "streaming" });
+    }
+
+    case "stream_error":
+      return { ...state, streamError: action.error };
 
     default:
       return state;
