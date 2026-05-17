@@ -17,6 +17,7 @@ import {
   type MuxState,
   type SessionState,
 } from "./reducer.js";
+import { subscribeToStream } from "./streamSubscriber.js";
 
 // ────────────────────────────────────────────────────────────────────────────
 // L2 hook — multiplexed.
@@ -56,6 +57,8 @@ export interface AgentMux extends MuxState {
   deleteSession: (sessionId: string) => Promise<void>;
   /** Fetch past wire events for this session and replay into reducer state. */
   loadHistory: (sessionId: string) => Promise<void>;
+  /** Clear the transient notice for a session (set by 409-on-reply etc.). */
+  clearNotice: (sessionId: string) => void;
 
   /** Last known list of server-persisted sessions. */
   sessionList: SessionListEntry[];
@@ -82,44 +85,26 @@ export function useAgentMux(opts: UseAgentMuxOptions): AgentMux {
     return createAgentClient(clientOpts);
   }, [baseUrl, token, injectedClient]);
 
-  // Persistent /stream subscription. One per (baseUrl, token, client) — never
-  // remounted on session switch, never per-session.
+  // Persistent /stream subscription via module-level singleton. One real
+  // client.events() loop per AgentClient regardless of how many hook
+  // instances mount — survives StrictMode double-mount, HMR remounts and
+  // page-error reloads, so we never accumulate browser-side SSE sockets
+  // past the HTTP/1.1 6-per-origin cap.
   useEffect(() => {
     if (!autoStart) return;
-    let aborted = false;
-    const ac = new AbortController();
-
-    (async () => {
-      try {
-        for await (const ev of client.events({ signal: ac.signal })) {
-          if (aborted) break;
-          const tap = onEventRef.current;
-          if (tap) {
-            try {
-              tap(ev);
-            } catch {
-              /* taps must not break the reducer */
-            }
-          }
-          dispatch({ type: "server_event", event: ev });
+    const unsubscribe = subscribeToStream(client, {
+      onEvent: (ev) => {
+        const tap = onEventRef.current;
+        if (tap) {
+          try { tap(ev); } catch { /* taps must not break the reducer */ }
         }
-      } catch (err) {
-        if (aborted) return;
-        const code =
-          err instanceof TransportError && err.status === 401 ? "unauthorized"
-          : err instanceof TransportError && err.status === 412 ? "stream_evicted"
-          : "stream_error";
-        dispatch({
-          type: "stream_error",
-          error: { code, message: err instanceof Error ? err.message : String(err) },
-        });
-      }
-    })();
-
-    return () => {
-      aborted = true;
-      ac.abort();
-    };
+        dispatch({ type: "server_event", event: ev });
+      },
+      onError: (err) => {
+        dispatch({ type: "stream_error", error: err });
+      },
+    });
+    return unsubscribe;
   }, [client, autoStart]);
 
   const refreshSessions = useCallback(async (): Promise<SessionListEntry[]> => {
@@ -197,12 +182,28 @@ export function useAgentMux(opts: UseAgentMuxOptions): AgentMux {
   const isAlreadyAnswered = (err: unknown): boolean =>
     err instanceof TransportError && err.status === 409;
 
+  const noticeForConflict = (
+    sid: string,
+    kind: "permission" | "question",
+  ): void => {
+    dispatch({
+      type: "set_notice",
+      sessionId: sid,
+      code: "already_answered",
+      message:
+        kind === "permission"
+          ? "Another subscriber already answered this permission request."
+          : "Another subscriber already answered this question.",
+    });
+  };
+
   const approve = useCallback(
     async (sid: string, correlationId: string, options?: ApproveOptions): Promise<void> => {
       try {
         await client.approve(sid, correlationId, options);
       } catch (err) {
         if (!isAlreadyAnswered(err)) throw err;
+        noticeForConflict(sid, "permission");
       }
       dispatch({ type: "permission_resolved", sessionId: sid, correlationId });
     },
@@ -214,6 +215,7 @@ export function useAgentMux(opts: UseAgentMuxOptions): AgentMux {
         await client.deny(sid, correlationId, options);
       } catch (err) {
         if (!isAlreadyAnswered(err)) throw err;
+        noticeForConflict(sid, "permission");
       }
       dispatch({ type: "permission_resolved", sessionId: sid, correlationId });
     },
@@ -225,11 +227,15 @@ export function useAgentMux(opts: UseAgentMuxOptions): AgentMux {
         await client.answer(sid, correlationId, answers);
       } catch (err) {
         if (!isAlreadyAnswered(err)) throw err;
+        noticeForConflict(sid, "question");
       }
       dispatch({ type: "question_resolved", sessionId: sid, correlationId });
     },
     [client]
   );
+  const clearNotice = useCallback((sid: string) => {
+    dispatch({ type: "clear_notice", sessionId: sid });
+  }, []);
   const setPermissionMode = useCallback(
     (sid: string, mode: string) => client.setPermissionMode(sid, mode),
     [client]
@@ -260,6 +266,7 @@ export function useAgentMux(opts: UseAgentMuxOptions): AgentMux {
     createSession,
     deleteSession,
     loadHistory,
+    clearNotice,
   };
 }
 
