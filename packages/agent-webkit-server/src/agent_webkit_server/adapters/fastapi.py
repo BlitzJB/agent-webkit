@@ -220,10 +220,22 @@ def create_app(
                 raise HTTPException(status_code=412, detail=str(e))
 
         async def gen() -> AsyncIterator[bytes]:
-            keepalive_interval = 15.0
+            # Short keepalive so client disconnects propagate fast — without
+            # this, an aborted SSE stream sits in `await sub.__anext__()` until
+            # the next event or timeout, holding the TCP slot (and tying up
+            # one of the browser's per-origin connection slots). Rapid session
+            # switching under HTTP/1.1 would otherwise queue up requests
+            # behind half-dead streams. 2s is short enough that switches feel
+            # snappy and long enough to be ignored by intermediaries.
+            keepalive_interval = 2.0
             try:
                 sub = s.event_log.subscribe(after_seq).__aiter__()
                 while True:
+                    # Bail out as soon as the client closes the connection,
+                    # rather than waiting for the next event/keepalive write
+                    # to discover the broken pipe.
+                    if await request.is_disconnected():
+                        return
                     try:
                         ev = await asyncio.wait_for(sub.__anext__(), timeout=keepalive_interval)
                     except asyncio.TimeoutError:
