@@ -225,23 +225,33 @@ def create_app(
                 raise HTTPException(status_code=412, detail=str(e))
 
         async def gen() -> AsyncIterator[bytes]:
-            # 2s keepalive so client disconnects propagate fast and idle
-            # intermediaries don't drop us.
+            # 2s keepalive so idle intermediaries don't drop us. Critically,
+            # we DON'T use `asyncio.wait_for(sub.__anext__(), timeout=...)` —
+            # that cancels the iterator on timeout, which unwinds the
+            # generator's internal `await waiter.wait()` with CancelledError,
+            # ends the generator, and on the next loop iteration raises
+            # StopAsyncIteration immediately → stream ends → client
+            # reconnects forever in a tight loop.
+            #
+            # Instead we ensure_future the iterator step and *poll* it with
+            # asyncio.wait so the task itself is never cancelled — we just
+            # observe whether it's done yet.
             keepalive_interval = 2.0
+            pending_task: Optional[asyncio.Task[Any]] = None
             try:
                 sub = registry.event_log.subscribe(after_seq).__aiter__()
                 while True:
-                    if await request.is_disconnected():
-                        return
-                    try:
-                        ev = await asyncio.wait_for(sub.__anext__(), timeout=keepalive_interval)
-                    except asyncio.TimeoutError:
+                    if pending_task is None:
+                        pending_task = asyncio.ensure_future(sub.__anext__())
+                    done, _ = await asyncio.wait({pending_task}, timeout=keepalive_interval)
+                    if not done:
                         yield b": keepalive\n\n"
                         continue
+                    try:
+                        ev = pending_task.result()
                     except StopAsyncIteration:
                         return
-                    # Wrap every event in the multiplex envelope so the client
-                    # can route to the right per-session reducer slot.
+                    pending_task = None
                     envelope = {"session_id": ev.session_id, "payload": ev.data}
                     payload = (
                         f"id: {ev.seq}\n"
@@ -252,6 +262,11 @@ def create_app(
             except EvictedError as e:
                 msg = json.dumps({"code": "evicted", "message": str(e)})
                 yield f"event: error\ndata: {msg}\n\n".encode("utf-8")
+            finally:
+                # If the response is torn down mid-flight, cancel the
+                # outstanding task so we don't leak it.
+                if pending_task is not None and not pending_task.done():
+                    pending_task.cancel()
 
         headers = {
             "cache-control": "no-cache",
