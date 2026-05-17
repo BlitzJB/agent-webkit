@@ -53,6 +53,9 @@ export interface SessionState {
   pendingQuestion: PendingQuestion | null;
   lastError: { code: string; message: string } | null;
   totalCostUsd: number;
+  /** Transient user-visible message — e.g. "another tab already answered".
+   *  The UI should render it as a soft banner and clear it on its own. */
+  notice: { code: string; message: string; ts: number } | null;
 }
 
 /** Top-level mux state — many sessions, keyed by id. */
@@ -69,6 +72,7 @@ export const initialSessionState: SessionState = {
   pendingQuestion: null,
   lastError: null,
   totalCostUsd: 0,
+  notice: null,
 };
 
 export const initialMuxState: MuxState = {
@@ -93,6 +97,8 @@ export type Action =
   | { type: "remove_session"; sessionId: string }
   | { type: "permission_resolved"; sessionId: string; correlationId: string }
   | { type: "question_resolved"; sessionId: string; correlationId: string }
+  | { type: "set_notice"; sessionId: string; code: string; message: string }
+  | { type: "clear_notice"; sessionId: string }
   | { type: "stream_error"; error: { code: string; message: string } };
 
 function appendDelta(blocks: ContentBlock[], delta: unknown): ContentBlock[] {
@@ -291,16 +297,51 @@ export function reduce(state: MuxState, action: Action): MuxState {
     }
 
     case "history_loaded": {
-      // Replay the history through reduceSession to populate the per-session
-      // state slot with past messages. seq for history entries is synthetic.
-      let s = state.sessions[action.sessionId] ?? initialSessionState;
+      // History always represents the past in chronological order, so the
+      // result must be: [history messages first, then any live messages we
+      // already received from /stream that history doesn't cover].
+      //
+      // Plain append-on-top-of-existing would interleave wrong: /stream
+      // replay (from the global ring) lands first on a fresh mount, then
+      // history dispatches and appends its older events at the bottom,
+      // burying the latest assistant response. snap-to-bottom then shows
+      // the oldest history instead of the latest turn. Dedupe by content
+      // identity and stitch them in chronological order.
+      const prev = state.sessions[action.sessionId] ?? initialSessionState;
+
+      // Build a fresh slot by replaying just the history events.
+      let h: SessionState = initialSessionState;
       let seq = -1;
       for (const e of action.events) {
-        s = reduceSession(s, e.event, e.payload as any, seq);
+        h = reduceSession(h, e.event, e.payload as any, seq);
         seq -= 1;
       }
-      // History is a snapshot — coming back from past, so reset status to idle.
-      return set(state, action.sessionId, { ...s, status: "idle" });
+
+      // Anything in the existing live state that history didn't capture
+      // (typically: the latest turn whose transcript hasn't fsynced yet)
+      // gets appended after the history block, preserving live order.
+      const hAssistantIds = new Set<string>();
+      const hUserContents = new Set<string>();
+      const hToolUseIds = new Set<string>();
+      for (const m of h.messages) {
+        if (m.kind === "assistant") hAssistantIds.add(m.message_id);
+        else if (m.kind === "user") hUserContents.add(JSON.stringify(m.content));
+        else if (m.kind === "tool_result") hToolUseIds.add(m.tool_use_id);
+      }
+      const liveExtras = prev.messages.filter((m) => {
+        if (m.kind === "assistant") return !hAssistantIds.has(m.message_id);
+        if (m.kind === "user") return !hUserContents.has(JSON.stringify(m.content));
+        if (m.kind === "tool_result") return !hToolUseIds.has(m.tool_use_id);
+        return false;
+      });
+
+      return set(state, action.sessionId, {
+        ...prev,
+        messages: [...h.messages, ...liveExtras],
+        // Don't clobber an in-flight streaming status — if a turn is mid-flight
+        // the user should still see the spinner.
+        status: prev.status === "streaming" ? "streaming" : "idle",
+      });
     }
 
     case "permission_resolved": {
@@ -313,6 +354,21 @@ export function reduce(state: MuxState, action: Action): MuxState {
       const s = state.sessions[action.sessionId];
       if (!s || s.pendingQuestion?.correlation_id !== action.correlationId) return state;
       return set(state, action.sessionId, { ...s, pendingQuestion: null, status: "streaming" });
+    }
+
+    case "set_notice": {
+      const s = state.sessions[action.sessionId];
+      if (!s) return state;
+      return set(state, action.sessionId, {
+        ...s,
+        notice: { code: action.code, message: action.message, ts: Date.now() },
+      });
+    }
+
+    case "clear_notice": {
+      const s = state.sessions[action.sessionId];
+      if (!s || s.notice === null) return state;
+      return set(state, action.sessionId, { ...s, notice: null });
     }
 
     case "stream_error":
