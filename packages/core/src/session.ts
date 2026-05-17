@@ -4,164 +4,47 @@ import type {
   CreateSessionResponse,
   DeliveredEvent,
   DenyOptions,
+  HistoryResponse,
   InboundMessage,
-  ServerEvent,
+  SessionListResponse,
   UserInput,
 } from "./types.js";
 import { Transport, TransportError } from "./transport.js";
 
-export interface SessionHandle {
-  readonly id: string;
-  readonly protocolVersion: string;
-  /**
-   * Async-iterable of typed, ordered events. Includes resumed events on reconnect
-   * (deduplicated via server seq id).
-   */
-  events(): AsyncIterable<DeliveredEvent>;
-  send(input: UserInput): Promise<void>;
-  interrupt(): Promise<void>;
-  approve(correlationId: string, options?: ApproveOptions): Promise<void>;
-  deny(correlationId: string, options?: DenyOptions): Promise<void>;
-  answer(correlationId: string, answers: unknown): Promise<void>;
-  setPermissionMode(mode: string): Promise<void>;
-  setModel(model: string | null): Promise<void>;
-  stopTask(taskId: string): Promise<void>;
-  /**
-   * Abort the SSE stream locally. Does NOT delete the server-side session, so a future
-   * `attachSession()` (or remount) can resume from `lastEventId`.
-   */
-  detach(): void;
-  /**
-   * Tear down the server-side session via DELETE. Idempotent — also aborts the local stream.
-   * Use this for permanent shutdown, not for component unmount in StrictMode.
-   */
-  close(): Promise<void>;
-  /** Last event seq seen — useful for caller-side resume. */
-  readonly lastEventId: string | undefined;
-}
-
-export class Session implements SessionHandle {
-  readonly id: string;
-  readonly protocolVersion: string;
-  private readonly transport: Transport;
-  private readonly abort: AbortController;
-  private _lastEventId: string | undefined;
-
-  constructor(
-    transport: Transport,
-    info: CreateSessionResponse,
-    opts?: { resumeFromEventId?: string }
-  ) {
-    this.transport = transport;
-    this.id = info.session_id;
-    this.protocolVersion = info.protocol_version;
-    this.abort = new AbortController();
-    this._lastEventId = opts?.resumeFromEventId;
-  }
-
-  get lastEventId(): string | undefined {
-    return this._lastEventId;
-  }
-
-  async *events(): AsyncIterable<DeliveredEvent> {
-    const path = `/sessions/${encodeURIComponent(this.id)}/stream`;
-    const streamOpts: { signal: AbortSignal; lastEventId?: string } = { signal: this.abort.signal };
-    if (this._lastEventId !== undefined) streamOpts.lastEventId = this._lastEventId;
-
-    for await (const raw of this.transport.streamEvents(path, streamOpts)) {
-      if (raw.id !== undefined) this._lastEventId = raw.id;
-      const eventName = raw.event ?? "message";
-      let parsed: unknown;
-      try {
-        parsed = raw.data === "" ? {} : JSON.parse(raw.data);
-      } catch {
-        // Malformed payload — surface as an error event rather than throwing,
-        // so consumer's iteration is not silently broken.
-        const seq = raw.id !== undefined ? Number(raw.id) : -1;
-        yield {
-          id: seq,
-          event: "error",
-          data: { code: "malformed_event", message: `Could not parse event ${eventName}` },
-        };
-        continue;
-      }
-      const seq = raw.id !== undefined ? Number(raw.id) : -1;
-      // We trust the server-side schema here (validated by Pydantic on the server,
-      // shared types in TS). Cast to the discriminated union.
-      yield { id: seq, event: eventName, data: parsed } as DeliveredEvent;
-      if (eventName === "done") return;
-    }
-  }
-
-  private async input(msg: InboundMessage): Promise<void> {
-    const res = await this.transport.post(`/sessions/${encodeURIComponent(this.id)}/input`, msg);
-    if (res.status === 204) return;
-    if (res.status === 409) {
-      const text = await res.text().catch(() => "");
-      throw new TransportError(`Conflict: another subscriber already replied`, 409, text);
-    }
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new TransportError(`Input rejected: ${res.status}`, res.status, text);
-    }
-  }
-
-  send(input: UserInput): Promise<void> {
-    return this.input({ type: "user_message", content: input });
-  }
-  interrupt(): Promise<void> {
-    return this.input({ type: "interrupt" });
-  }
-  approve(correlationId: string, options: ApproveOptions = {}): Promise<void> {
-    const msg: InboundMessage = {
-      type: "permission_response",
-      correlation_id: correlationId,
-      behavior: "allow",
-    };
-    if (options.updatedInput !== undefined) msg.updated_input = options.updatedInput;
-    if (options.updatedPermissions !== undefined) msg.updated_permissions = options.updatedPermissions;
-    return this.input(msg);
-  }
-  deny(correlationId: string, options: DenyOptions = {}): Promise<void> {
-    const msg: InboundMessage = {
-      type: "permission_response",
-      correlation_id: correlationId,
-      behavior: "deny",
-    };
-    if (options.message !== undefined) msg.message = options.message;
-    if (options.interrupt !== undefined) msg.interrupt = options.interrupt;
-    return this.input(msg);
-  }
-  answer(correlationId: string, answers: unknown): Promise<void> {
-    return this.input({ type: "question_response", correlation_id: correlationId, answers });
-  }
-  setPermissionMode(mode: string): Promise<void> {
-    return this.input({ type: "set_permission_mode", mode });
-  }
-  setModel(model: string | null): Promise<void> {
-    return this.input({ type: "set_model", model });
-  }
-  stopTask(taskId: string): Promise<void> {
-    return this.input({ type: "stop_task", task_id: taskId });
-  }
-
-  detach(): void {
-    this.abort.abort();
-  }
-
-  async close(): Promise<void> {
-    this.abort.abort();
-    try {
-      await this.transport.delete(`/sessions/${encodeURIComponent(this.id)}`);
-    } catch (err) {
-      // best-effort
-    }
-  }
-}
+// ────────────────────────────────────────────────────────────────────────────
+// L1 SDK — flat, multiplexed client.
+//
+// One client per process. One persistent SSE stream (`GET /stream`) that
+// fans in every wire event from every session, tagged by `session_id`.
+// Action methods take a session id; there's no per-session client object.
+// ────────────────────────────────────────────────────────────────────────────
 
 export interface AgentClient {
-  createSession(opts?: CreateSessionOptions): Promise<Session>;
-  attachSession(sessionId: string, opts?: { resumeFromEventId?: string }): Session;
+  /** List every persisted session (server-side metadata). */
+  listSessions(): Promise<SessionListResponse>;
+  /** POST /sessions. Returns the new session id + protocol version. */
+  createSession(opts?: CreateSessionOptions): Promise<CreateSessionResponse>;
+  /** DELETE /sessions/{id} — purges metadata + transcript replay history. */
+  deleteSession(sessionId: string): Promise<void>;
+  /** Past wire events for a session — call this on first-attach to populate UI. */
+  history(sessionId: string): Promise<HistoryResponse>;
+  /**
+   * Async-iterable of typed events across ALL sessions, tagged with
+   * `session_id`. Auto-reconnects with Last-Event-ID through transient
+   * drops. Cancellable via `signal`.
+   */
+  events(opts?: { signal?: AbortSignal; resumeFromEventId?: string }): AsyncIterable<DeliveredEvent>;
+  // Action methods — all take a session id.
+  send(sessionId: string, input: UserInput): Promise<void>;
+  interrupt(sessionId: string): Promise<void>;
+  approve(sessionId: string, correlationId: string, options?: ApproveOptions): Promise<void>;
+  deny(sessionId: string, correlationId: string, options?: DenyOptions): Promise<void>;
+  answer(sessionId: string, correlationId: string, answers: unknown): Promise<void>;
+  setPermissionMode(sessionId: string, mode: string): Promise<void>;
+  setModel(sessionId: string, model: string | null): Promise<void>;
+  stopTask(sessionId: string, taskId: string): Promise<void>;
+  /** Last seq id seen on the multiplexed stream — useful for caller-side resume. */
+  readonly lastEventId: string | undefined;
 }
 
 export interface CreateAgentClientOptions {
@@ -170,16 +53,118 @@ export interface CreateAgentClientOptions {
   fetchImpl?: typeof fetch | undefined;
 }
 
+// Internal envelope shape that /stream delivers inside each event's `data`.
+interface MuxEnvelope {
+  session_id: string;
+  payload: unknown;
+}
+
 export function createAgentClient(opts: CreateAgentClientOptions): AgentClient {
   const transport = new Transport(opts);
+  let lastEventId: string | undefined;
+
+  async function input(sessionId: string, msg: InboundMessage): Promise<void> {
+    const res = await transport.post(
+      `/sessions/${encodeURIComponent(sessionId)}/input`,
+      msg,
+    );
+    if (res.status === 204) return;
+    if (res.status === 409) {
+      const text = await res.text().catch(() => "");
+      throw new TransportError("Conflict: another subscriber already replied", 409, text);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new TransportError(`Input rejected: ${res.status}`, res.status, text);
+    }
+  }
+
   return {
-    async createSession(createOpts) {
-      const info = await transport.postJSON<CreateSessionResponse>("/sessions", createOpts ?? {});
-      return new Session(transport, info);
+    get lastEventId(): string | undefined {
+      return lastEventId;
     },
-    attachSession(sessionId, attachOpts) {
-      const info: CreateSessionResponse = { session_id: sessionId, protocol_version: "1.0" };
-      return new Session(transport, info, attachOpts);
+
+    async listSessions(): Promise<SessionListResponse> {
+      return await transport.getJSON<SessionListResponse>("/sessions");
     },
+
+    async createSession(createOpts?: CreateSessionOptions): Promise<CreateSessionResponse> {
+      return await transport.postJSON<CreateSessionResponse>("/sessions", createOpts ?? {});
+    },
+
+    async deleteSession(sessionId: string): Promise<void> {
+      await transport.delete(`/sessions/${encodeURIComponent(sessionId)}`);
+    },
+
+    async history(sessionId: string): Promise<HistoryResponse> {
+      return await transport.getJSON<HistoryResponse>(
+        `/sessions/${encodeURIComponent(sessionId)}/history`,
+      );
+    },
+
+    async *events(opts?: { signal?: AbortSignal; resumeFromEventId?: string }): AsyncIterable<DeliveredEvent> {
+      const streamOpts: { signal?: AbortSignal; lastEventId?: string } = {};
+      if (opts?.signal) streamOpts.signal = opts.signal;
+      const startFrom = opts?.resumeFromEventId ?? lastEventId;
+      if (startFrom !== undefined) streamOpts.lastEventId = startFrom;
+
+      for await (const raw of transport.streamEvents("/stream", streamOpts)) {
+        if (raw.id !== undefined) lastEventId = raw.id;
+        const eventName = raw.event ?? "message";
+        let envelope: MuxEnvelope | null = null;
+        try {
+          const parsed = raw.data === "" ? null : JSON.parse(raw.data);
+          if (parsed && typeof parsed === "object" && "session_id" in parsed && "payload" in parsed) {
+            envelope = parsed as MuxEnvelope;
+          }
+        } catch {
+          // Fall through — surface as an error event below.
+        }
+        const seq = raw.id !== undefined ? Number(raw.id) : -1;
+        if (envelope === null) {
+          yield {
+            id: seq,
+            session_id: "",
+            event: "error",
+            data: { code: "malformed_event", message: `Could not parse event ${eventName}` },
+          } as DeliveredEvent;
+          continue;
+        }
+        yield {
+          id: seq,
+          session_id: envelope.session_id,
+          event: eventName,
+          data: envelope.payload,
+        } as DeliveredEvent;
+      }
+    },
+
+    send: (sid, content) => input(sid, { type: "user_message", content }),
+    interrupt: (sid) => input(sid, { type: "interrupt" }),
+    approve(sid, correlationId, options = {}) {
+      const msg: InboundMessage = {
+        type: "permission_response",
+        correlation_id: correlationId,
+        behavior: "allow",
+      };
+      if (options.updatedInput !== undefined) msg.updated_input = options.updatedInput;
+      if (options.updatedPermissions !== undefined) msg.updated_permissions = options.updatedPermissions;
+      return input(sid, msg);
+    },
+    deny(sid, correlationId, options = {}) {
+      const msg: InboundMessage = {
+        type: "permission_response",
+        correlation_id: correlationId,
+        behavior: "deny",
+      };
+      if (options.message !== undefined) msg.message = options.message;
+      if (options.interrupt !== undefined) msg.interrupt = options.interrupt;
+      return input(sid, msg);
+    },
+    answer: (sid, correlationId, answers) =>
+      input(sid, { type: "question_response", correlation_id: correlationId, answers }),
+    setPermissionMode: (sid, mode) => input(sid, { type: "set_permission_mode", mode }),
+    setModel: (sid, model) => input(sid, { type: "set_model", model }),
+    stopTask: (sid, taskId) => input(sid, { type: "stop_task", task_id: taskId }),
   };
 }

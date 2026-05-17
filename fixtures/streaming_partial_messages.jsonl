@@ -1,0 +1,10 @@
+{"kind": "expect_user_query"}
+{"kind": "outbound", "message": {"type": "StreamEvent", "uuid": "u1", "session_id": "fake-stream", "event": {"type": "message_start", "message": {"id": "m_str"}}}}
+{"kind": "outbound", "message": {"type": "StreamEvent", "uuid": "u2", "session_id": "fake-stream", "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}}}
+{"kind": "outbound", "message": {"type": "StreamEvent", "uuid": "u3", "session_id": "fake-stream", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hel"}}}}
+{"kind": "outbound", "message": {"type": "StreamEvent", "uuid": "u4", "session_id": "fake-stream", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}}}}
+{"kind": "outbound", "message": {"type": "StreamEvent", "uuid": "u5", "session_id": "fake-stream", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": " world"}}}}
+{"kind": "outbound", "message": {"type": "StreamEvent", "uuid": "u6", "session_id": "fake-stream", "event": {"type": "content_block_stop", "index": 0}}}
+{"kind": "outbound", "message": {"type": "StreamEvent", "uuid": "u7", "session_id": "fake-stream", "event": {"type": "message_stop"}}}
+{"kind": "outbound", "message": {"type": "AssistantMessage", "id": "m_str", "content": [{"type": "text", "text": "Hello world"}], "model": "claude-opus-4-7", "stop_reason": "end_turn"}}
+{"kind": "outbound", "message": {"type": "ResultMessage", "session_id": "fake-stream", "subtype": "success", "total_cost_usd": 0.0042}}

@@ -1,20 +1,28 @@
-"""Per-session append-only event log with multi-subscriber fan-out.
+"""Process-global wire event log with multi-subscriber fan-out.
 
-Each event has a server-assigned monotonic seq id. The log is a bounded ring (default 1000
-events). Subscribers tail with their own cursor; if a subscriber requests a seq that has
-been evicted, the server raises EvictedError → 412 Precondition Failed.
+Every event from every session in this process flows into one ring buffer.
+The wire protocol multiplexes them onto a single `GET /stream` connection,
+with each frame tagged by its origin ``session_id``. Subscribers tail with
+their own cursor; if a subscriber requests a seq that has been evicted from
+the ring, the server raises EvictedError → 412 Precondition Failed.
+
+This replaces the per-session EventLog model. Past-message history (i.e. what
+existed before the subscriber connected) is no longer served via SSE replay
+— callers fetch it from ``GET /sessions/{id}/history``, which sources it
+from the SDK's on-disk transcript via ``transcript_replay``.
 """
 from __future__ import annotations
 
 import asyncio
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
 
 
 @dataclass
 class LoggedEvent:
     seq: int
+    session_id: str
     event: str
     data: Any
 
@@ -23,8 +31,12 @@ class EvictedError(Exception):
     """Requested Last-Event-ID is older than the oldest event still in the ring."""
 
 
-class EventLog:
-    def __init__(self, max_size: int = 1000) -> None:
+class GlobalEventLog:
+    """One ring buffer per process. Much larger than the old per-session
+    EventLog (default 10k) since it carries traffic from all live sessions
+    combined."""
+
+    def __init__(self, max_size: int = 10_000) -> None:
         self._max = max_size
         self._buf: deque[LoggedEvent] = deque(maxlen=max_size)
         self._next_seq = 1
@@ -35,13 +47,14 @@ class EventLog:
     def last_seq(self) -> int:
         return self._next_seq - 1
 
-    def append(self, event: str, data: Any) -> LoggedEvent:
+    def append(self, session_id: str, event: str, data: Any) -> LoggedEvent:
         if self._closed:
             raise RuntimeError("Event log is closed")
-        ev = LoggedEvent(seq=self._next_seq, event=event, data=data)
+        ev = LoggedEvent(
+            seq=self._next_seq, session_id=session_id, event=event, data=data
+        )
         self._next_seq += 1
         self._buf.append(ev)
-        # Wake all waiters; they'll re-check their cursor.
         for w in self._waiters:
             w.set()
         self._waiters = [w for w in self._waiters if not w.is_set()]
@@ -58,9 +71,17 @@ class EventLog:
             return self._next_seq  # nothing yet — any seq <= last_seq is fine
         return self._buf[0].seq
 
-    async def subscribe(self, after_seq: int = 0) -> AsyncIterator[LoggedEvent]:
+    async def subscribe(
+        self, after_seq: int = 0, session_ids: Optional[set[str]] = None
+    ) -> AsyncIterator[LoggedEvent]:
         """Yield events with seq > after_seq, blocking when caught up.
-        Raises EvictedError if after_seq is older than the ring.
+
+        If ``session_ids`` is provided, only events from those sessions pass
+        through — useful for per-session views and tests. ``None`` means no
+        filter; all sessions stream through (the normal multiplexed mode).
+
+        Raises :class:`EvictedError` if after_seq is older than the ring's
+        current oldest entry.
         """
         if after_seq > 0 and self._buf and after_seq < self._oldest_seq() - 1:
             raise EvictedError(
@@ -69,14 +90,13 @@ class EventLog:
 
         cursor = after_seq
         while True:
-            # Drain everything past cursor.
             for ev in list(self._buf):
                 if ev.seq > cursor:
                     cursor = ev.seq
-                    yield ev
+                    if session_ids is None or ev.session_id in session_ids:
+                        yield ev
             if self._closed:
                 return
-            # Wait for a new append.
             waiter = asyncio.Event()
             self._waiters.append(waiter)
             try:

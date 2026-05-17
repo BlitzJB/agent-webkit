@@ -102,11 +102,29 @@ class CreateSessionRequest(BaseModel):
     model: Optional[str] = None
     permission_mode: Optional[str] = None
     cwd: Optional[str] = None
+    # Opt-in: when true, the bridge asks the SDK for raw stream events and
+    # translates content_block_delta frames into wire `message_delta` events.
+    include_partial_messages: bool = False
 
 
 class CreateSessionResponse(BaseModel):
     session_id: str
     protocol_version: str = "1.0"
+
+
+class SessionListEntry(BaseModel):
+    id: str
+    sdk_session_id: Optional[str] = None
+    model: Optional[str] = None
+    permission_mode: Optional[str] = None
+    cwd: Optional[str] = None
+    include_partial_messages: bool = False
+    created_at: float
+    last_seen_at: float
+
+
+class SessionListResponse(BaseModel):
+    sessions: list[SessionListEntry]
 
 
 # --- Outbound event payloads (for documentation; the event log stores dicts) ---
@@ -177,6 +195,7 @@ class McpStatusChangeData(BaseModel):
 # Names of all valid outbound events. Used for contract validation.
 OUTBOUND_EVENT_NAMES: frozenset[str] = frozenset({
     "session_ready",
+    "user_message",
     "message_delta",
     "message_complete",
     "tool_use",

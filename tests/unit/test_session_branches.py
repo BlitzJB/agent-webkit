@@ -189,7 +189,7 @@ async def test_evicted_last_event_id_returns_412():
             try:
                 r = await asyncio.wait_for(
                     c.get(
-                        f"/sessions/{sid}/stream",
+                        "/stream",
                         headers={"last-event-id": "999999999"},
                     ),
                     timeout=0.5,

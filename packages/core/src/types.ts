@@ -49,6 +49,7 @@ export type InboundMessage =
 
 export type ServerEvent =
   | { event: "session_ready"; data: { session_id: string; protocol_version: string } }
+  | { event: "user_message"; data: { content: string | ContentBlock[] } }
   | { event: "message_delta"; data: { message_id: string; delta: ContentBlock | { text: string } } }
   | { event: "message_complete"; data: { message_id: string; message: AssistantMessage } }
   | {
@@ -84,13 +85,15 @@ export type ServerEvent =
     }
   | { event: "error"; data: { code: string; message: string } }
   | { event: "mcp_status_change"; data: { server_name: string; status: string } }
+  | { event: "permission_mode_changed"; data: { mode: string } }
   | { event: "done"; data: Record<string, never> };
 
 export type ServerEventName = ServerEvent["event"];
 export type EventOf<N extends ServerEventName> = Extract<ServerEvent, { event: N }>;
 
-// Each delivered event is tagged with its monotonic server-side seq id.
-export type DeliveredEvent = ServerEvent & { id: number };
+// Each delivered event is tagged with its monotonic server-side seq id AND
+// the originating session_id (multiplexed across all sessions on one stream).
+export type DeliveredEvent = ServerEvent & { id: number; session_id: string };
 
 export interface AssistantMessage {
   id: string;
@@ -123,9 +126,43 @@ export interface CreateSessionOptions {
   model?: string;
   permission_mode?: string;
   cwd?: string;
+  /**
+   * Ask the server to enable SDK partial-message streaming. When true, the
+   * stream carries `message_delta` events with text deltas (and
+   * `input_json_delta` chunks for tool inputs) before the final
+   * `message_complete`. Default false.
+   */
+  include_partial_messages?: boolean;
 }
 
 export interface CreateSessionResponse {
   session_id: string;
   protocol_version: string;
+}
+
+export interface SessionListEntry {
+  id: string;
+  sdk_session_id: string | null;
+  model: string | null;
+  permission_mode: string | null;
+  cwd: string | null;
+  include_partial_messages: boolean;
+  created_at: number;
+  last_seen_at: number;
+}
+
+export interface SessionListResponse {
+  sessions: SessionListEntry[];
+}
+
+// Past wire events for a session — fetched via GET /sessions/{id}/history.
+// Each entry has the same `event` name and `payload` shape as the matching
+// event on /stream, minus the multiplex envelope.
+export interface HistoryEntry {
+  event: ServerEventName;
+  payload: unknown;
+}
+
+export interface HistoryResponse {
+  events: HistoryEntry[];
 }

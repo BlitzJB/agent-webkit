@@ -1,8 +1,5 @@
-export { useAgentSession } from "./useAgentSession.js";
-export type {
-  UseAgentSessionOptions,
-  UseAgentSessionReturn,
-} from "./useAgentSession.js";
+export { useAgentMux, useActiveSession } from "./useAgentMux.js";
+export type { UseAgentMuxOptions, AgentMux } from "./useAgentMux.js";
 export { useGenerativeUI } from "./useGenerativeUI.js";
 export type {
   UseGenerativeUIOptions,
@@ -10,9 +7,10 @@ export type {
   GenUIRenderer,
   GenUIRenderers,
 } from "./useGenerativeUI.js";
-export { reduce, initialState } from "./reducer.js";
+export { reduce, initialMuxState, initialSessionState } from "./reducer.js";
 export type {
-  AgentState,
+  MuxState,
+  SessionState,
   Action,
   Status,
   PendingPermission,
